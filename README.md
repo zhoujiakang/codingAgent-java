@@ -1,16 +1,14 @@
 # AgentJava
 
-一个用 Java 编写的命令行 coding agent。
+一个用 Java 编写的命令行 coding agent：对接 LLM 进行流式对话，并带有终端交互界面（TUI）。
 
-
-## 当前能力
+## 功能特性
 
 - 对接 LLM 并**流式**接收回答（SSE），边出字边渲染。
-- 多 provider 支持：Anthropic（Messages API）、OpenAI（Chat Completions API）、以及 OpenAI 兼容服务（DeepSeek / Kimi / GLM 等，走 `openai-compat`）。
-- **多轮对话**：历史消息会随每一轮累积并回传给模型。
+- 多 provider 支持：Anthropic（Messages API）、OpenAI（Chat Completions API），以及 OpenAI 兼容服务（DeepSeek / Kimi / GLM 等，走 `openai-compat`）。
+- **多轮对话**：历史消息随每一轮累积并回传给模型。
 - 终端 TUI：等待时显示 spinner + 实时计时，回答结束后整段用 Markdown 定型渲染（代码块、列表等）。
 - 配置系统：支持项目级 / 全局两级 `config.yaml`。
-
 
 ## 技术栈
 
@@ -105,7 +103,3 @@ java -jar build/libs/agentjava.jar
 ```bash
 ./gradlew test
 ```
-
-## 说明
-
-- 仓库只包含 `agent_java` 工程本身。
