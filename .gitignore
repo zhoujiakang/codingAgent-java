@@ -1,0 +1,14 @@
+build/
+.gradle/
+*.jar
+.idea/
+*.iml
+out/
+
+# 运行时目录里只有 config.yaml 含真实密钥，示例文件要保留
+.agentjava/*
+!.agentjava/config.yaml.example
+!.agentjava/.gitkeep
+
+# macOS 系统文件
+.DS_Store

@@ -1,0 +1,33 @@
+# AgentJava 运行配置示例
+#
+# 使用方式：复制本文件为 config.yaml，填入你自己的 api_key。
+#   cp .agentjava/config.yaml.example .agentjava/config.yaml
+#
+# config.yaml 含真实密钥，已在 .gitignore 中忽略，不要提交。
+
+providers:
+  # Anthropic 官方：走 Messages API，支持扩展思考
+  - name: anthropic-official
+    protocol: anthropic
+    base_url: https://api.anthropic.com
+    api_key: "your-api-key-here"
+    model: claude-sonnet-4-6
+    thinking: true
+
+  # OpenAI 官方：走 Chat Completions API
+  # - name: openai-official
+  #   protocol: openai
+  #   base_url: https://api.openai.com/v1
+  #   api_key: "your-api-key-here"
+  #   model: gpt-4o
+
+  # OpenAI 兼容服务（DeepSeek、Kimi、GLM、MiniMax 等）：
+  # 协议填 openai-compat，base_url 必填
+  # - name: my-compat-provider
+  #   protocol: openai-compat
+  #   base_url: https://api.example.com/v1
+  #   api_key: "your-api-key-here"
+  #   model: model-name
+
+# 只配一个 provider 时，启动直接进入对话；
+# 配了多个，启动后先用方向键选一个（选定后本次会话不再切换）。

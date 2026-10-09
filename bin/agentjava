@@ -1,0 +1,25 @@
+#!/bin/sh
+# AgentJava 启动器
+#
+# 用法：
+#   1. 给它加可执行权限：chmod +x agent_java/bin/agentjava
+#   2. 放进 PATH，比如：ln -s "$(pwd)/agent_java/bin/agentjava" /usr/local/bin/agentjava
+#   3. 之后在任意目录直接敲：agentjava
+#
+# 注意：这里刻意不 cd 到项目目录——当前工作目录会被写进 system prompt，
+# 让模型知道你现在在哪个项目里干活。
+
+set -e
+
+# 定位脚本所在目录，再上一级是项目根
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+PROJECT_DIR=$(cd "$SCRIPT_DIR/.." && pwd)
+JAR="$PROJECT_DIR/build/libs/agentjava.jar"
+
+if [ ! -f "$JAR" ]; then
+    echo "找不到 $JAR"
+    echo "请先在项目目录执行一次：./gradlew shadowJar"
+    exit 1
+fi
+
+exec java -jar "$JAR" "$@"

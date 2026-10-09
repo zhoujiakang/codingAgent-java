@@ -1,0 +1,32 @@
+package com.agentjava.llm;
+
+/**
+ * 协议无关的流式事件。
+ *
+ * 这是封装层的核心：上层只认这套类型，不认识任何 SDK 的类型。
+ * 不管底下走的是 Anthropic 还是 OpenAI，吐出来的都是这几种事件，
+ * 所以将来换供应商、加新协议，上层代码一行都不用动。
+ */
+public sealed interface StreamEvent {
+
+    /** 正文文本增量；模型一个词一个词地往外吐，界面就一个词一个词地显示。 */
+    record TextDelta(String text) implements StreamEvent {
+    }
+
+    /**
+     * 扩展思考的增量。
+     *
+     * 按要求，思考内容接收即丢弃，不渲染、不折叠展示。
+     * 保留这个事件类型是为了让上层知道"模型确实在思考"，而不是卡住了。
+     */
+    record ThinkingDelta(String text) implements StreamEvent {
+    }
+
+    /** 本轮响应结束，带上停止原因与 token 用量。 */
+    record StreamEnd(String stopReason, int inputTokens, int outputTokens) implements StreamEvent {
+    }
+
+    /** 请求失败；上层展示错误并回到空闲，不退出程序（F11）。 */
+    record Error(String message) implements StreamEvent {
+    }
+}
