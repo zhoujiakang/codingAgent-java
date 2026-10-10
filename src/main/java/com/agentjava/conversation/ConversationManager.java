@@ -3,6 +3,9 @@ package com.agentjava.conversation;
 import java.util.ArrayList;
 import java.util.List;
 
+import com.agentjava.conversation.ToolResultBlock;
+import com.agentjava.conversation.ToolUseBlock;
+
 /**
  * 对话管理器。
  *
@@ -36,6 +39,28 @@ public class ConversationManager {
     /** 追加一条错误占位消息；带 ERROR 状态，不会被 toApiFormat 回传给 API。 */
     public Message addErrorMessage(String text) {
         Message m = new Message(Message.Role.ASSISTANT, text, Message.Status.ERROR);
+        messages.add(m);
+        return m;
+    }
+
+    /**
+     * 追加一条带工具调用的助手消息：正文 text 与若干 tool_use 块。
+     * 对应的 tool_result 需由 {@link #addToolResultsMessage(List)} 以 user 角色补上。
+     */
+    public Message addAssistantMessageWithTools(String text, List<ToolUseBlock> toolUses) {
+        Message m = new Message(Message.Role.ASSISTANT, text == null ? "" : text, Message.Status.COMPLETE);
+        m.setToolUses(toolUses);
+        messages.add(m);
+        return m;
+    }
+
+    /**
+     * 追加一条工具结果消息：以 user 角色发送，内部装着一组 tool_result 块。
+     * 这样才满足 API 的 user/assistant 交替规则。
+     */
+    public Message addToolResultsMessage(List<ToolResultBlock> results) {
+        Message m = new Message(Message.Role.USER, "", Message.Status.COMPLETE);
+        m.setToolResults(results);
         messages.add(m);
         return m;
     }

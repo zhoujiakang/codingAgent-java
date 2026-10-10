@@ -1,16 +1,24 @@
 package com.agentjava.llm;
 
-import com.agentjava.config.ProviderConfig;
-import com.agentjava.conversation.ConversationManager;
-import com.agentjava.conversation.Message;
 import com.anthropic.client.okhttp.AnthropicOkHttpClient;
+import com.anthropic.core.JsonValue;
 import com.anthropic.core.http.StreamResponse;
+import com.anthropic.models.messages.ContentBlockParam;
 import com.anthropic.models.messages.MessageCreateParams;
 import com.anthropic.models.messages.MessageParam;
 import com.anthropic.models.messages.RawMessageStreamEvent;
+import com.anthropic.models.messages.TextBlockParam;
 import com.anthropic.models.messages.ThinkingConfigEnabled;
+import com.anthropic.models.messages.Tool;
+import com.anthropic.models.messages.ToolResultBlockParam;
+import com.anthropic.models.messages.ToolUseBlockParam;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.agentjava.config.ProviderConfig;
+import com.agentjava.conversation.ConversationManager;
+import com.agentjava.conversation.Message;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.BlockingQueue;
@@ -25,6 +33,8 @@ import java.util.concurrent.LinkedBlockingQueue;
  * 这些差异全部关在本类里，上层完全看不到 anthropic-java 的影子。
  */
 public class AnthropicClient implements LlmClient {
+
+    private static final ObjectMapper MAPPER = new ObjectMapper();
 
     /** 单次请求允许生成的最大 token 数。 */
     protected static final int DEFAULT_MAX_TOKENS = 4096;
@@ -75,7 +85,7 @@ public class AnthropicClient implements LlmClient {
         // 与 TUI 主线程互不阻塞（N1）
         Thread.startVirtualThread(() -> {
             try {
-                doStream(conv, queue);
+                doStream(conv, tools, queue);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             } catch (Exception e) {
@@ -85,13 +95,14 @@ public class AnthropicClient implements LlmClient {
         return queue;
     }
 
-    protected void doStream(ConversationManager conv, BlockingQueue<StreamEvent> queue) throws Exception {
+    protected void doStream(ConversationManager conv, List<Map<String, Object>> tools,
+                            BlockingQueue<StreamEvent> queue) throws Exception {
         var paramsBuilder = MessageCreateParams.builder()
                 .model(model)
                 .maxTokens(DEFAULT_MAX_TOKENS)
                 // Anthropic 把 system 提到顶层参数，而不是塞进 messages（与 OpenAI 不同）
                 .system(systemPrompt)
-                .messages(buildMessages(conv.toApiMessages()));
+                .messages(buildMessages(conv.getMessages()));
 
         if (thinking) {
             paramsBuilder.thinking(ThinkingConfigEnabled.builder()
@@ -99,9 +110,21 @@ public class AnthropicClient implements LlmClient {
                     .build());
         }
 
+        // 把工具 schema 发给模型——这是 Function Calling 让模型"知道能调什么"的关键
+        if (tools != null && !tools.isEmpty()) {
+            for (var schema : tools) {
+                paramsBuilder.addTool(buildTool(schema));
+            }
+        }
+
         int inputTokens = 0;
         int outputTokens = 0;
         String stopReason = "end_turn";
+
+        // 流式解析 tool_use：跨多个 delta 累积的 JSON 碎片
+        String currentToolName = "";
+        String currentToolId = "";
+        var jsonAccum = new StringBuilder();
 
         try (StreamResponse<RawMessageStreamEvent> response =
                      sdkClient.messages().createStreaming(paramsBuilder.build())) {
@@ -110,17 +133,46 @@ public class AnthropicClient implements LlmClient {
             while (iterator.hasNext()) {
                 var event = iterator.next();
 
-                if (event.isMessageStart()) {
-                    // message_start 带着 input_tokens（轮次越多这个数字越大）
-                    inputTokens = (int) event.asMessageStart().message().usage().inputTokens();
+                if (event.isContentBlockStart()) {
+                    var block = event.asContentBlockStart().contentBlock();
+                    if (block.isToolUse()) {
+                        var tu = block.asToolUse();
+                        currentToolName = tu.name();
+                        currentToolId = tu.id();
+                        jsonAccum.setLength(0);
+                        offer(queue, new StreamEvent.ToolCallStart(currentToolId, currentToolName));
+                    }
                 } else if (event.isContentBlockDelta()) {
                     var delta = event.asContentBlockDelta().delta();
                     if (delta.isText()) {
                         offer(queue, new StreamEvent.TextDelta(delta.asText().text()));
                     } else if (delta.isThinking()) {
                         // 思考增量：接收即丢弃，绝不混入正文（F5）
-                        offer(queue, new StreamEvent.ThinkingDelta(delta.asThinking().thinking()));
+                        // delta.asThinking().thinking() 这里不消费，仅占位
+                    } else if (delta.isInputJson()) {
+                        // 累积工具参数的 JSON 碎片
+                        String partial = delta.asInputJson().partialJson();
+                        jsonAccum.append(partial);
+                        offer(queue, new StreamEvent.ToolCallDelta(partial));
                     }
+                } else if (event.isContentBlockStop()) {
+                    if (!currentToolName.isEmpty()) {
+                        Map<String, Object> args;
+                        try {
+                            @SuppressWarnings("unchecked")
+                            var parsed = MAPPER.readValue(jsonAccum.toString(), Map.class);
+                            args = parsed;
+                        } catch (Exception e) {
+                            // 容错：JSON 拼接失败不崩溃，用空 Map 兜底，模型看到后重试
+                            args = new java.util.HashMap<>();
+                        }
+                        offer(queue, new StreamEvent.ToolCallComplete(currentToolId, currentToolName, args));
+                        currentToolName = "";
+                        currentToolId = "";
+                        jsonAccum.setLength(0);
+                    }
+                } else if (event.isMessageStart()) {
+                    inputTokens = (int) event.asMessageStart().message().usage().inputTokens();
                 } else if (event.isMessageDelta()) {
                     var delta = event.asMessageDelta().delta();
                     if (delta.stopReason().isPresent()) {
@@ -134,14 +186,88 @@ public class AnthropicClient implements LlmClient {
         offer(queue, new StreamEvent.StreamEnd(stopReason, inputTokens, outputTokens));
     }
 
-    /** 把内部消息转成 Anthropic 的消息参数。 */
-    protected List<MessageParam> buildMessages(List<Message.ApiMessage> apiMessages) {
+    /** 把内部消息转成 Anthropic 的消息参数，支持文本、tool_use、tool_result 三种块。 */
+    protected List<MessageParam> buildMessages(List<Message> messages) {
         var result = new ArrayList<MessageParam>();
-        for (var m : apiMessages) {
-            result.add(MessageParam.builder()
-                    .role("user".equals(m.role()) ? MessageParam.Role.USER : MessageParam.Role.ASSISTANT)
-                    .content(m.content())
-                    .build());
+        for (var msg : messages) {
+            if (msg.getStatus() == Message.Status.ERROR) {
+                continue;
+            }
+            boolean hasToolUses = msg.getToolUses() != null && !msg.getToolUses().isEmpty();
+            boolean hasToolResults = msg.getToolResults() != null && !msg.getToolResults().isEmpty();
+            String text = msg.getContent() == null ? "" : msg.getContent();
+
+            if ("assistant".equals(msg.getRole().apiValue())) {
+                if (hasToolUses) {
+                    var content = new ArrayList<ContentBlockParam>();
+                    if (!text.isBlank()) {
+                        content.add(ContentBlockParam.ofText(TextBlockParam.builder().text(text).build()));
+                    }
+                    for (var tu : msg.getToolUses()) {
+                        content.add(ContentBlockParam.ofToolUse(ToolUseBlockParam.builder()
+                                .id(tu.toolUseId())
+                                .name(tu.toolName())
+                                .input(JsonValue.from(tu.arguments()))
+                                .build()));
+                    }
+                    result.add(MessageParam.builder()
+                            .role(MessageParam.Role.ASSISTANT)
+                            .contentOfBlockParams(content)
+                            .build());
+                } else if (!text.isBlank()) {
+                    result.add(MessageParam.builder()
+                            .role(MessageParam.Role.ASSISTANT)
+                            .content(text)
+                            .build());
+                }
+            } else { // user
+                if (hasToolResults) {
+                    var content = new ArrayList<ContentBlockParam>();
+                    for (var tr : msg.getToolResults()) {
+                        var b = ToolResultBlockParam.builder()
+                                .toolUseId(tr.toolUseId())
+                                .isError(tr.isError())
+                                .content(tr.content());
+                        content.add(ContentBlockParam.ofToolResult(b.build()));
+                    }
+                    result.add(MessageParam.builder()
+                            .role(MessageParam.Role.USER)
+                            .contentOfBlockParams(content)
+                            .build());
+                } else if (!text.isBlank()) {
+                    result.add(MessageParam.builder()
+                            .role(MessageParam.Role.USER)
+                            .content(text)
+                            .build());
+                }
+            }
+        }
+        return result;
+    }
+
+    /** 把一个工具 schema（{name, description, input_schema}）转成 Anthropic 的 Tool 对象。 */
+    private Tool buildTool(Map<String, Object> schema) {
+        var builder = Tool.builder().name((String) schema.get("name"));
+        if (schema.containsKey("description")) {
+            builder.description((String) schema.get("description"));
+        }
+        var inputSchema = (Map<String, Object>) schema.getOrDefault(
+                "input_schema", Map.of("type", "object", "properties", Map.of()));
+        builder.inputSchema(Tool.InputSchema.builder()
+                .type(JsonValue.from(inputSchema.getOrDefault("type", "object")))
+                .putAllAdditionalProperties(toJsonValueMap(inputSchema))
+                .build());
+        return builder.build();
+    }
+
+    /** 把 input_schema 的其余字段（properties、required 等）转成 SDK 的 JsonValue 映射。 */
+    private static Map<String, JsonValue> toJsonValueMap(Map<String, Object> map) {
+        var result = new LinkedHashMap<String, JsonValue>();
+        for (var entry : map.entrySet()) {
+            if ("type".equals(entry.getKey())) {
+                continue;
+            }
+            result.put(entry.getKey(), JsonValue.from(entry.getValue()));
         }
         return result;
     }

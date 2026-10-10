@@ -5,16 +5,22 @@ import com.agentjava.config.ConfigException;
 import com.agentjava.config.ConfigLoader;
 import com.agentjava.config.ProviderConfig;
 import com.agentjava.conversation.ConversationManager;
+import com.agentjava.conversation.ToolResultBlock;
+import com.agentjava.conversation.ToolUseBlock;
 import com.agentjava.llm.LlmClient;
 import com.agentjava.llm.LlmException;
 import com.agentjava.llm.StreamEvent;
 import com.agentjava.prompt.PromptBuilder;
+import com.agentjava.tool.ToolExecutor;
+import com.agentjava.tool.ToolRegistry;
 import com.agentjava.tui.AgentModel;
 import com.agentjava.tui.MarkdownRenderer;
 import com.agentjava.tui.tea.Program;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.BlockingQueue;
 
 /**
@@ -62,37 +68,66 @@ public class AgentJava {
         }
     }
 
-    /** 非交互模式：发一轮就走，用于脚本和验证。 */
+    /** 非交互模式：发一轮就走，用于脚本和验证。支持模型发起工具调用（单步循环）。 */
     private static void runOneShot(String prompt) {
         AppConfig config = loadConfig();
         List<ProviderConfig> providers = config.getProviders();
         ProviderConfig cfg = providers.get(0);
         try {
             LlmClient client = LlmClient.create(cfg, PromptBuilder.buildSystemPrompt(System.getProperty("user.dir")));
+            ToolRegistry registry = ToolRegistry.createDefault();
+            List<Map<String, Object>> tools = registry.getAllSchemas(cfg.normalizedProtocol());
             ConversationManager conversation = new ConversationManager();
             conversation.addUserMessage(prompt);
 
             StringBuilder full = new StringBuilder();
             long start = System.currentTimeMillis();
-            BlockingQueue<StreamEvent> queue = client.stream(conversation);
-            while (true) {
-                StreamEvent event = queue.take();
-                if (event instanceof StreamEvent.TextDelta delta) {
-                    full.append(delta.text());
-                    System.out.print(delta.text());
-                    System.out.flush();
-                } else if (event instanceof StreamEvent.Error error) {
-                    System.out.println();
-                    System.err.println("✗ " + error.message());
-                    System.exit(1);
-                    return;
-                } else if (event instanceof StreamEvent.StreamEnd end) {
-                    System.out.println();
-                    System.out.println();
-                    System.out.println(MarkdownRenderer.render(full.toString(), 100));
-                    System.out.println("↑" + end.inputTokens() + " ↓" + end.outputTokens()
-                            + " · " + (System.currentTimeMillis() - start) / 1000.0 + "s");
-                    return;
+            int rounds = 0;
+            while (rounds < 6) {
+                rounds++;
+                full.setLength(0);
+                BlockingQueue<StreamEvent> queue = client.stream(conversation, tools);
+                List<ToolUseBlock> pending = new ArrayList<>();
+                while (true) {
+                    StreamEvent event = queue.take();
+                    if (event instanceof StreamEvent.TextDelta delta) {
+                        full.append(delta.text());
+                        System.out.print(delta.text());
+                        System.out.flush();
+                    } else if (event instanceof StreamEvent.ToolCallStart s) {
+                        System.out.println();
+                        System.out.println("⏺ " + s.toolName());
+                    } else if (event instanceof StreamEvent.ToolCallDelta ignored) {
+                        // 参数碎片不打到终端，避免刷屏
+                    } else if (event instanceof StreamEvent.ToolCallComplete c) {
+                        pending.add(new ToolUseBlock(c.toolId(), c.toolName(), c.arguments()));
+                    } else if (event instanceof StreamEvent.Error error) {
+                        System.out.println();
+                        System.err.println("✗ " + error.message());
+                        System.exit(1);
+                        return;
+                    } else if (event instanceof StreamEvent.StreamEnd end) {
+                        if (!pending.isEmpty()) {
+                            conversation.addAssistantMessageWithTools(full.toString(), new ArrayList<>(pending));
+                            var results = ToolExecutor.execute(registry, pending);
+                            conversation.addToolResultsMessage(results);
+                            for (int i = 0; i < pending.size(); i++) {
+                                ToolResultBlock r = results.get(i);
+                                String firstLine = r.content().split("\n", -1)[0];
+                                if (firstLine.length() > 120) {
+                                    firstLine = firstLine.substring(0, 120) + "…";
+                                }
+                                System.out.println("  ↳ " + firstLine);
+                            }
+                            break; // 跳出内层循环，进入下一轮（把工具结果喂回模型）
+                        }
+                        System.out.println();
+                        System.out.println();
+                        System.out.println(MarkdownRenderer.render(full.toString(), 100));
+                        System.out.println("↑" + end.inputTokens() + " ↓" + end.outputTokens()
+                                + " · " + (System.currentTimeMillis() - start) / 1000.0 + "s");
+                        return;
+                    }
                 }
             }
         } catch (InterruptedException e) {

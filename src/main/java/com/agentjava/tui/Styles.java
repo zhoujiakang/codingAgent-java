@@ -35,6 +35,9 @@ public final class Styles {
     /** 选中项、就绪提示这类正向强调。 */
     public static final Style ACCENT = Style.of().fg(ANSI256Color.TEAL);
 
+    /** 工具调用与结果摘要的展示。 */
+    public static final Style TOOL = Style.of().fg(ANSI256Color.GREEN).bold();
+
     private Styles() {
     }
 }

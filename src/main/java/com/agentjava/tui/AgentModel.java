@@ -2,9 +2,13 @@ package com.agentjava.tui;
 
 import com.agentjava.config.ProviderConfig;
 import com.agentjava.conversation.ConversationManager;
+import com.agentjava.conversation.ToolResultBlock;
+import com.agentjava.conversation.ToolUseBlock;
 import com.agentjava.llm.LlmClient;
 import com.agentjava.llm.StreamEvent;
 import com.agentjava.prompt.PromptBuilder;
+import com.agentjava.tool.ToolExecutor;
+import com.agentjava.tool.ToolRegistry;
 import com.agentjava.tui.tea.Ansi;
 import com.agentjava.tui.tea.Command;
 import com.agentjava.tui.tea.KeyPressMessage;
@@ -17,6 +21,7 @@ import com.agentjava.tui.tea.WindowSizeMessage;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.concurrent.BlockingQueue;
 
 /**
@@ -42,6 +47,15 @@ public class AgentModel implements Model {
     private final String workingDir;
     private final String systemPrompt;
     private final ConversationManager conversation = new ConversationManager();
+
+    /** 工具注册中心：六个内置工具 + 共享的文件状态缓存。 */
+    private final ToolRegistry registry = ToolRegistry.createDefault();
+
+    /** 本轮流式期间累积的工具调用（模型一个回合可能发起多个）。 */
+    private final List<ToolUseBlock> pendingToolUses = new ArrayList<>();
+    private String currentToolId;
+    private String currentToolName;
+    private final StringBuilder currentToolJson = new StringBuilder();
 
     private Program program;
     private AppState state;
@@ -196,10 +210,15 @@ public class AgentModel implements Model {
 
         streaming = true;
         streamBuf.setLength(0);
+        pendingToolUses.clear();
+        currentToolId = null;
+        currentToolName = null;
+        currentToolJson.setLength(0);
         spinnerVerb = SpinnerVerbs.random();
         requestStartMillis = System.currentTimeMillis();
 
-        BlockingQueue<StreamEvent> queue = llmClient.stream(conversation);
+        BlockingQueue<StreamEvent> queue = llmClient.stream(
+                conversation, registry.getAllSchemas(activeProvider.normalizedProtocol()));
         Thread.startVirtualThread(() -> pumpStream(queue));
         return echo;
     }
@@ -230,9 +249,64 @@ public class AgentModel implements Model {
             }
             // 思考增量接收即丢弃，绝不渲染，也不混入正文（F5 / AC5）
             case StreamEvent.ThinkingDelta ignored -> Command.none();
-            case StreamEvent.StreamEnd end -> finishTurn(streamBuf.toString(), end.inputTokens(), end.outputTokens());
+            // 工具调用开始：记下 id / 名称，准备累积参数碎片
+            case StreamEvent.ToolCallStart s -> {
+                currentToolId = s.toolId();
+                currentToolName = s.toolName();
+                currentToolJson.setLength(0);
+                yield Command.none();
+            }
+            // 工具参数 JSON 碎片：仅累积，真正的解析在 ToolCallComplete
+            case StreamEvent.ToolCallDelta d -> {
+                currentToolJson.append(d.text());
+                yield Command.none();
+            }
+            // 单个工具参数完整解析完毕，登记一次工具调用
+            case StreamEvent.ToolCallComplete c -> {
+                pendingToolUses.add(new ToolUseBlock(c.toolId(), c.toolName(), c.arguments()));
+                yield Command.none();
+            }
+            case StreamEvent.StreamEnd end -> finishTurnOrContinue(streamBuf.toString(), end);
             case StreamEvent.Error error -> failTurn(error.message());
         };
+    }
+
+    /**
+     * 本轮结束：若模型发起了工具调用，就执行并把结果回传，再发起一轮（单步）；
+     * 否则按普通回复落成一条消息。
+     */
+    private Command finishTurnOrContinue(String fullText, StreamEvent.StreamEnd end) {
+        if (!pendingToolUses.isEmpty()) {
+            var uses = new ArrayList<>(pendingToolUses);
+            // 把"模型决定调工具"这一回合落进历史：正文 + tool_use 块
+            conversation.addAssistantMessageWithTools(fullText, uses);
+            // 真正执行工具，拿到 tool_result
+            var results = ToolExecutor.execute(registry, uses);
+            conversation.addToolResultsMessage(results);
+
+            // 先把工具调用与结果摘要打到 scrollback，让用户看到"动手"了什么
+            var cmds = new ArrayList<Command>();
+            for (int i = 0; i < uses.size(); i++) {
+                ToolUseBlock use = uses.get(i);
+                ToolResultBlock res = results.get(i);
+                cmds.add(Command.println(Styles.TOOL.render("⏺ " + use.toolName() + " " + previewArgs(use.arguments()))));
+                cmds.add(Command.println(Styles.MUTED.render("  ↳ " + previewResult(res.content()))));
+            }
+
+            // 清零本轮工具状态，准备下一轮（模型基于工具结果作答）
+            pendingToolUses.clear();
+            currentToolId = null;
+            currentToolName = null;
+            currentToolJson.setLength(0);
+            streamBuf.setLength(0);
+
+            // 再发起一轮：把工具结果喂回模型，拿最终回复
+            BlockingQueue<StreamEvent> queue = llmClient.stream(
+                    conversation, registry.getAllSchemas(activeProvider.normalizedProtocol()));
+            Thread.startVirtualThread(() -> pumpStream(queue));
+            return Command.batch(cmds.toArray(new Command[0]));
+        }
+        return finishTurn(fullText, end.inputTokens(), end.outputTokens());
     }
 
     /** 本轮正常结束：缓冲区落成一条完整消息，整段用 Markdown 定型渲染。 */
@@ -422,5 +496,30 @@ public class AgentModel implements Model {
 
     private static String formatSeconds(long millis) {
         return String.format(Locale.ROOT, "%.1fs", millis / 1000.0);
+    }
+
+    /** 工具调用参数的紧凑预览：直接打印 Map，过长截断。 */
+    private static String previewArgs(Map<String, Object> args) {
+        if (args == null || args.isEmpty()) {
+            return "";
+        }
+        String s = args.toString();
+        if (s.length() > 100) {
+            s = s.substring(0, 100) + "…";
+        }
+        return s;
+    }
+
+    /** 工具结果的紧凑预览：取首行，过长截断。 */
+    private static String previewResult(String content) {
+        if (content == null || content.isBlank()) {
+            return "(空)";
+        }
+        String firstLine = content.split("\n", -1)[0];
+        if (firstLine.length() > 120) {
+            firstLine = firstLine.substring(0, 120) + "…";
+        }
+        int lines = (int) content.lines().count();
+        return lines > 1 ? firstLine + " (+" + (lines - 1) + " 行)" : firstLine;
     }
 }

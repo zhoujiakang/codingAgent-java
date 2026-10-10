@@ -52,6 +52,10 @@ public final class Message {
     private int inputTokens;
     private int outputTokens;
 
+    // 工具调用与工具结果（引入 Function Calling 后为非空）
+    private List<ToolUseBlock> toolUses;
+    private List<ToolResultBlock> toolResults;
+
     public Message(Role role, String content, Status status) {
         this.id = UUID.randomUUID().toString();
         this.role = role;
@@ -102,6 +106,22 @@ public final class Message {
 
     public void setOutputTokens(int outputTokens) {
         this.outputTokens = outputTokens;
+    }
+
+    public List<ToolUseBlock> getToolUses() {
+        return toolUses;
+    }
+
+    public void setToolUses(List<ToolUseBlock> toolUses) {
+        this.toolUses = toolUses;
+    }
+
+    public List<ToolResultBlock> getToolResults() {
+        return toolResults;
+    }
+
+    public void setToolResults(List<ToolResultBlock> toolResults) {
+        this.toolResults = toolResults;
     }
 
     /**
