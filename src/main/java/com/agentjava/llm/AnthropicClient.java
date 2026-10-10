@@ -47,7 +47,7 @@ public class AnthropicClient implements LlmClient {
     private final ProviderConfig config;
     private final String model;
     private final boolean thinking;
-    private final String systemPrompt;
+    private String systemPrompt;
 
     public AnthropicClient(ProviderConfig cfg, String systemPrompt) {
         if (cfg.getApiKey() == null || cfg.getApiKey().isBlank()) {
@@ -69,6 +69,11 @@ public class AnthropicClient implements LlmClient {
     @Override
     public ProviderConfig config() {
         return config;
+    }
+
+    @Override
+    public void setSystemPrompt(String prompt) {
+        this.systemPrompt = prompt == null ? "" : prompt;
     }
 
     @Override

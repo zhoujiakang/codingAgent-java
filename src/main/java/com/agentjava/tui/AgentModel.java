@@ -1,13 +1,11 @@
 package com.agentjava.tui;
 
+import com.agentjava.agent.Agent;
+import com.agentjava.agent.AgentEvent;
 import com.agentjava.config.ProviderConfig;
 import com.agentjava.conversation.ConversationManager;
-import com.agentjava.conversation.ToolResultBlock;
-import com.agentjava.conversation.ToolUseBlock;
 import com.agentjava.llm.LlmClient;
-import com.agentjava.llm.StreamEvent;
 import com.agentjava.prompt.PromptBuilder;
-import com.agentjava.tool.ToolExecutor;
 import com.agentjava.tool.ToolRegistry;
 import com.agentjava.tui.tea.Ansi;
 import com.agentjava.tui.tea.Command;
@@ -27,13 +25,12 @@ import java.util.concurrent.BlockingQueue;
 /**
  * 主 TUI 模型。
  *
- * 这是交互中枢：状态机、输入缓冲、流式缓冲、spinner、渲染都在这一层。
- * 它自己不读键盘也不写终端——读键盘交给 Program，写终端通过返回 Command 委派，
- * 所以整个 update() 都是纯粹的状态变换。
+ * 真正复杂的"调 LLM → 执行工具 → 喂回结果"主循环搬到了 {@link Agent} 里。
+ * 这个模型只负责三件事：把用户输入交给 Agent、把 Agent 吐出的 {@link AgentEvent}
+ * 渲染成界面、处理本地输入命令。Agent 跑在虚拟线程上，事件通过队列回投到主线程，
+ * 所以这里的 update() 始终是纯粹的状态变换，不碰网络、不碰 IO。
  *
- * 一轮对话的节奏：
- * 用户输入 → 加入历史 → 带完整历史调 API → 片段进缓冲区并实时渲染
- * → 本轮结束，缓冲区落成一条消息 → 等待下一轮输入。
+ * 一轮对话的节奏：用户输入 → 进历史 → Agent 循环多轮直到完成 → 事件流实时渲染。
  */
 public class AgentModel implements Model {
 
@@ -51,22 +48,22 @@ public class AgentModel implements Model {
     /** 工具注册中心：六个内置工具 + 共享的文件状态缓存。 */
     private final ToolRegistry registry = ToolRegistry.createDefault();
 
-    /** 本轮流式期间累积的工具调用（模型一个回合可能发起多个）。 */
-    private final List<ToolUseBlock> pendingToolUses = new ArrayList<>();
-    private String currentToolId;
-    private String currentToolName;
-    private final StringBuilder currentToolJson = new StringBuilder();
-
     private Program program;
     private AppState state;
     private int selectedIndex = 0;
     private ProviderConfig activeProvider;
     private LlmClient llmClient;
 
+    /** Plan Mode 开关：开启后 Agent 只暴露只读工具，并注入"只规划不改动"的指引。 */
+    private boolean planMode = false;
+
+    /** 本轮是否因错误收场，用于在 LoopComplete 时避免重复落地。 */
+    private boolean agentErrored = false;
+
     /** 输入缓冲：Alt+Enter / Ctrl+J 插入换行，Enter 提交。 */
     private final StringBuilder input = new StringBuilder();
 
-    /** 流式缓冲：片段实时进这里，本轮结束才落成一条历史消息。 */
+    /** 流式缓冲：片段实时进这里，本轮结束才落成一条历史消息（由 Agent 负责落地）。 */
     private final StringBuilder streamBuf = new StringBuilder();
     private boolean streaming = false;
     private long requestStartMillis = 0;
@@ -95,7 +92,7 @@ public class AgentModel implements Model {
         }
     }
 
-    /** Program 建好之后回灌进来，流式线程要靠它把事件投回事件循环。 */
+    /** Program 建好之后回灌进来，Agent 的事件要靠它投回事件循环。 */
     public void setProgram(Program program) {
         this.program = program;
     }
@@ -104,7 +101,6 @@ public class AgentModel implements Model {
 
     @Override
     public Command init() {
-        // 启动横幅等拿到窗口尺寸后再输出，所以这里没有副作用
         return Command.none();
     }
 
@@ -122,8 +118,8 @@ public class AgentModel implements Model {
         if (msg instanceof KeyPressMessage key) {
             return UpdateResult.of(this, handleKey(key));
         }
-        if (msg instanceof StreamEventMessage sem) {
-            return UpdateResult.of(this, handleStreamEvent(sem.event()));
+        if (msg instanceof AgentEventMessage aem) {
+            return UpdateResult.of(this, handleAgentEvent(aem.event()));
         }
         return UpdateResult.of(this);
     }
@@ -136,7 +132,6 @@ public class AgentModel implements Model {
     // ───────────────────────── 事件处理 ─────────────────────────
 
     private Command handleKey(KeyPressMessage key) {
-        // Ctrl+C 在任何状态下都能安全退出（F10）
         if ("ctrl+c".equals(key.key()) || "ctrl+d".equals(key.key())) {
             return Command.quit();
         }
@@ -155,14 +150,12 @@ public class AgentModel implements Model {
                 state = AppState.CHAT;
             }
             default -> {
-                // 其他按键在选择界面里没有意义
             }
         }
         return Command.none();
     }
 
     private Command handleChatKey(KeyPressMessage key) {
-        // 流式期间不接受新的提交，也不改输入缓冲（F9）
         if (streaming) {
             return Command.none();
         }
@@ -181,13 +174,12 @@ public class AgentModel implements Model {
             case "ctrl+u" -> input.setLength(0);
             case "rune" -> input.append(key.rune());
             default -> {
-                // 方向键等暂不支持（历史导航留待后续）
             }
         }
         return Command.none();
     }
 
-    /** 提交一轮对话。 */
+    /** 提交一轮对话，或切换 Plan Mode。 */
     private Command submit() {
         String text = input.toString();
         input.setLength(0);
@@ -198,9 +190,17 @@ public class AgentModel implements Model {
         if (EXIT_COMMAND.equals(trimmed)) {
             return Command.quit();
         }
+        // 切换 Plan Mode：/plan 只读只规划，/do 恢复正常工作模式
+        if ("/plan".equals(trimmed)) {
+            planMode = true;
+            return Command.println(Styles.ACCENT.render("✻ 已进入 Plan Mode（只读，只规划不改动）"));
+        }
+        if ("/do".equals(trimmed)) {
+            planMode = false;
+            return Command.println(Styles.ACCENT.render("✻ 已退出 Plan Mode，恢复正常工作模式"));
+        }
 
-        // 用户输入先写进 scrollback，再进历史：
-        // 这样即使请求失败，用户也能看到自己问了什么
+        // 用户输入先写进 scrollback，再进历史：即使请求失败也能看到自己问了什么
         Command echo = Command.println(Styles.PROMPT.render("❯ ") + Styles.USER.render(text));
         conversation.addUserMessage(text);
 
@@ -210,28 +210,28 @@ public class AgentModel implements Model {
 
         streaming = true;
         streamBuf.setLength(0);
-        pendingToolUses.clear();
-        currentToolId = null;
-        currentToolName = null;
-        currentToolJson.setLength(0);
+        agentErrored = false;
         spinnerVerb = SpinnerVerbs.random();
         requestStartMillis = System.currentTimeMillis();
 
-        BlockingQueue<StreamEvent> queue = llmClient.stream(
-                conversation, registry.getAllSchemas(activeProvider.normalizedProtocol()));
-        Thread.startVirtualThread(() -> pumpStream(queue));
+        // 把活儿交给 Agent：它在虚拟线程里跑 ReAct 主循环，事件回投到本事件循环
+        Agent agent = new Agent(llmClient, registry, activeProvider.normalizedProtocol(), systemPrompt);
+        agent.setPlanMode(planMode);
+        agent.setMaxIterations(200);
+        BlockingQueue<AgentEvent> queue = agent.run(conversation);
+        Thread.startVirtualThread(() -> pumpAgentEvents(queue));
         return echo;
     }
 
-    /** 把流式事件逐个投回事件循环；遇到终止事件就收工。 */
-    private void pumpStream(BlockingQueue<StreamEvent> queue) {
+    /** 把 Agent 事件逐个投回事件循环；遇到终止事件就收工。 */
+    private void pumpAgentEvents(BlockingQueue<AgentEvent> queue) {
         try {
             while (true) {
-                StreamEvent event = queue.take();
+                AgentEvent event = queue.take();
                 if (program != null) {
-                    program.send(new StreamEventMessage(event));
+                    program.send(new AgentEventMessage(event));
                 }
-                if (event instanceof StreamEvent.StreamEnd || event instanceof StreamEvent.Error) {
+                if (event instanceof AgentEvent.LoopComplete || event instanceof AgentEvent.ErrorEvent) {
                     return;
                 }
             }
@@ -240,108 +240,69 @@ public class AgentModel implements Model {
         }
     }
 
-    private Command handleStreamEvent(StreamEvent event) {
+    private Command handleAgentEvent(AgentEvent event) {
         return switch (event) {
-            // 正文增量进缓冲区，界面立刻就能看到（F8 前半段）
-            case StreamEvent.TextDelta delta -> {
-                streamBuf.append(delta.text());
+            // 正文增量进缓冲区，界面立刻就能看到
+            case AgentEvent.StreamText st -> {
+                streamBuf.append(st.text());
                 yield Command.none();
             }
-            // 思考增量接收即丢弃，绝不渲染，也不混入正文（F5 / AC5）
-            case StreamEvent.ThinkingDelta ignored -> Command.none();
-            // 工具调用开始：记下 id / 名称，准备累积参数碎片
-            case StreamEvent.ToolCallStart s -> {
-                currentToolId = s.toolId();
-                currentToolName = s.toolName();
-                currentToolJson.setLength(0);
+            // 工具调用：把"动手"了什么打到 scrollback
+            case AgentEvent.ToolUseEvent tu ->
+                    Command.println(Styles.TOOL.render("⏺ " + tu.toolName() + " " + previewArgs(tu.args())));
+            // 工具结果：只显示首行预览
+            case AgentEvent.ToolResultEvent tr ->
+                    Command.println(Styles.MUTED.render("  ↳ " + previewResult(tr.output())));
+            // 累计 token 用量，留着状态栏展示
+            case AgentEvent.UsageEvent ue -> {
+                lastInputTokens = ue.inputTokens();
+                lastOutputTokens = ue.outputTokens();
+                usageAvailable = true;
                 yield Command.none();
             }
-            // 工具参数 JSON 碎片：仅累积，真正的解析在 ToolCallComplete
-            case StreamEvent.ToolCallDelta d -> {
-                currentToolJson.append(d.text());
-                yield Command.none();
-            }
-            // 单个工具参数完整解析完毕，登记一次工具调用
-            case StreamEvent.ToolCallComplete c -> {
-                pendingToolUses.add(new ToolUseBlock(c.toolId(), c.toolName(), c.arguments()));
-                yield Command.none();
-            }
-            case StreamEvent.StreamEnd end -> finishTurnOrContinue(streamBuf.toString(), end);
-            case StreamEvent.Error error -> failTurn(error.message());
+            case AgentEvent.TurnComplete tc -> Command.none();
+            case AgentEvent.RetryEvent re ->
+                    Command.println(Styles.MUTED.render("↻ " + re.reason()));
+            // 整个循环结束：缓冲区落成最终回复
+            case AgentEvent.LoopComplete lc -> finishTurn(streamBuf.toString());
+            // 出错：展示错误，程序不退出
+            case AgentEvent.ErrorEvent ee -> failTurn(ee.message());
         };
     }
 
-    /**
-     * 本轮结束：若模型发起了工具调用，就执行并把结果回传，再发起一轮（单步）；
-     * 否则按普通回复落成一条消息。
-     */
-    private Command finishTurnOrContinue(String fullText, StreamEvent.StreamEnd end) {
-        if (!pendingToolUses.isEmpty()) {
-            var uses = new ArrayList<>(pendingToolUses);
-            // 把"模型决定调工具"这一回合落进历史：正文 + tool_use 块
-            conversation.addAssistantMessageWithTools(fullText, uses);
-            // 真正执行工具，拿到 tool_result
-            var results = ToolExecutor.execute(registry, uses);
-            conversation.addToolResultsMessage(results);
-
-            // 先把工具调用与结果摘要打到 scrollback，让用户看到"动手"了什么
-            var cmds = new ArrayList<Command>();
-            for (int i = 0; i < uses.size(); i++) {
-                ToolUseBlock use = uses.get(i);
-                ToolResultBlock res = results.get(i);
-                cmds.add(Command.println(Styles.TOOL.render("⏺ " + use.toolName() + " " + previewArgs(use.arguments()))));
-                cmds.add(Command.println(Styles.MUTED.render("  ↳ " + previewResult(res.content()))));
-            }
-
-            // 清零本轮工具状态，准备下一轮（模型基于工具结果作答）
-            pendingToolUses.clear();
-            currentToolId = null;
-            currentToolName = null;
-            currentToolJson.setLength(0);
-            streamBuf.setLength(0);
-
-            // 再发起一轮：把工具结果喂回模型，拿最终回复
-            BlockingQueue<StreamEvent> queue = llmClient.stream(
-                    conversation, registry.getAllSchemas(activeProvider.normalizedProtocol()));
-            Thread.startVirtualThread(() -> pumpStream(queue));
-            return Command.batch(cmds.toArray(new Command[0]));
+    /** 本轮正常结束：缓冲区渲染成 Markdown；历史消息由 Agent 负责落地。 */
+    private Command finishTurn(String fullText) {
+        if (agentErrored) {
+            streaming = false;
+            return Command.none();
         }
-        return finishTurn(fullText, end.inputTokens(), end.outputTokens());
-    }
-
-    /** 本轮正常结束：缓冲区落成一条完整消息，整段用 Markdown 定型渲染。 */
-    private Command finishTurn(String fullText, int inputTokens, int outputTokens) {
         long elapsed = System.currentTimeMillis() - requestStartMillis;
         streaming = false;
         streamBuf.setLength(0);
 
         lastElapsedMillis = elapsed;
-        lastInputTokens = inputTokens;
-        lastOutputTokens = outputTokens;
-        usageAvailable = true;
 
         if (fullText.isBlank()) {
             return Command.println(Styles.MUTED.render("（本轮没有返回文本内容）"));
         }
-        // 只有完整内容才进历史，半截内容不会污染上下文
-        conversation.addAssistantMessage(fullText);
-
         String rendered = MarkdownRenderer.render(fullText, Math.max(30, width - 2));
         String meta = Styles.MUTED.render("✻ " + spinnerVerb + " for " + formatSeconds(elapsed)
-                + " · ↑" + inputTokens + " ↓" + outputTokens);
+                + " · ↑" + lastInputTokens + " ↓" + lastOutputTokens);
         return Command.println(rendered + "\n" + meta);
     }
 
-    /** 本轮失败：错误以独立样式展示，程序不退出，用户可以直接问下一句（F11）。 */
+    /** 本轮失败：错误以独立样式展示，程序不退出，用户可以直接问下一句。 */
     private Command failTurn(String message) {
         streaming = false;
+        agentErrored = true;
         String partial = streamBuf.toString();
         streamBuf.setLength(0);
-        // 中断时已经收到的那部分照样落成消息，下一轮还能接着聊
-        if (!partial.isBlank()) {
+        // 中断时已经收到的那部分照样落成消息，下一轮还能接着聊（历史由 Agent 管，
+        // 这里只在 Agent 没落地时补一条，避免重复）
+        if (!partial.isBlank() && conversation.getMessages().stream()
+                .noneMatch(m -> partial.equals(m.getContent()))) {
             conversation.addAssistantMessage(partial);
         }
-        conversation.addErrorMessage(message);
         return Command.println(Styles.ERROR.render("✗ " + message));
     }
 
@@ -359,10 +320,9 @@ public class AgentModel implements Model {
         lines.add(Styles.ACCENT.render("  请选择要使用的 provider"));
         lines.add("");
         for (int i = 0; i < providers.size(); i++) {
-            ProviderConfig cfg = providers.get(i);
             boolean selected = i == selectedIndex;
             String marker = selected ? Styles.PROMPT.render(" ❯ ") : "   ";
-            String label = cfg.getName() + "  (" + cfg.getModel() + ")";
+            String label = providers.get(i).getName() + "  (" + providers.get(i).getModel() + ")";
             lines.add(marker + (selected ? Styles.USER.render(label) : Styles.MUTED.render(label)));
         }
         lines.add("");
@@ -377,7 +337,6 @@ public class AgentModel implements Model {
 
         if (streaming) {
             long elapsed = System.currentTimeMillis() - requestStartMillis;
-            // 自请求发出就开始计时，第一个字还没到也能看到秒数在跳（F12 / N2）
             lines.add(Styles.SPINNER.render("✻ " + SpinnerVerbs.frame() + " " + spinnerVerb + "… ("
                     + (elapsed / 1000) + "s)"));
             if (!streamBuf.isEmpty()) {
@@ -399,7 +358,8 @@ public class AgentModel implements Model {
         List<String> rows = new ArrayList<>();
         String raw = input.toString();
         if (raw.isEmpty()) {
-            rows.add(Styles.PROMPT.render("❯ ") + Styles.PLACEHOLDER.render("Send a message..."));
+            String placeholder = planMode ? "Plan mode: 探索代码并给出计划…" : "Send a message...";
+            rows.add(Styles.PROMPT.render("❯ ") + Styles.PLACEHOLDER.render(placeholder));
         } else {
             String[] logicalLines = raw.split("\n", -1);
             for (int i = 0; i < logicalLines.length; i++) {
@@ -421,9 +381,12 @@ public class AgentModel implements Model {
         return out;
     }
 
-    /** 状态栏：左侧 provider 名，右侧模型名 + token 用量 + 本轮耗时（F7-e）。 */
+    /** 状态栏：左侧 provider 名，右侧模型名 + token 用量 + 本轮耗时；Plan Mode 时标 PLAN。 */
     private String renderStatusBar() {
         String left = activeProvider == null ? "-" : activeProvider.getName();
+        if (planMode) {
+            left += Styles.ACCENT.render(" · PLAN");
+        }
         String right = activeProvider == null ? "-" : activeProvider.getModel();
         if (usageAvailable) {
             right += " · ↑" + lastInputTokens + " ↓" + lastOutputTokens;
@@ -457,10 +420,10 @@ public class AgentModel implements Model {
         return sb.toString().stripTrailing();
     }
 
-    /** 启动后的一行就绪提示（F7-b）。 */
+    /** 启动后的一行就绪提示。 */
     private String renderReadyLine() {
         return Styles.ACCENT.render("✻ 已就绪")
-                + Styles.MUTED.render(" · 输入 " + EXIT_COMMAND + " 或按 Ctrl+C 退出");
+                + Styles.MUTED.render(" · " + EXIT_COMMAND + " 退出 · /plan 进入计划模式 · /do 退出计划模式");
     }
 
     private String separator() {
@@ -469,7 +432,7 @@ public class AgentModel implements Model {
 
     // ───────────────────────── 小工具 ─────────────────────────
 
-    /** 按可见宽度软换行；输入缓冲里没有转义序列，所以按码位算宽度就够。 */
+    /** 按可见宽度软换行。 */
     private static List<String> wrapPlain(String text, int maxWidth) {
         List<String> out = new ArrayList<>();
         if (maxWidth <= 1) {

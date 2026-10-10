@@ -47,9 +47,19 @@ public class ToolRegistry {
      * @param protocol 协议名：anthropic / openai / openai-compat
      */
     public List<Map<String, Object>> getAllSchemas(String protocol) {
+        return schemasOf(listTools(), protocol);
+    }
+
+    /**
+     * 按协议生成「给定工具子集」的 schema 列表。
+     *
+     * <p>Plan Mode 用得到：只把只读类（READ）工具交给模型，写文件和命令类工具
+     * 根本不进 schema，模型自然无法调用——这是计划模式的第一道硬约束。
+     */
+    public List<Map<String, Object>> schemasOf(List<Tool> toolList, String protocol) {
         boolean openai = "openai".equals(protocol) || "openai-compat".equals(protocol);
         var schemas = new ArrayList<Map<String, Object>>();
-        for (var tool : tools.values()) {
+        for (var tool : toolList) {
             // 每个工具自己实现 schema()，返回 {name, description, input_schema}
             var base = tool.schema();
             if (openai) {

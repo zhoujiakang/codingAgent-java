@@ -53,7 +53,7 @@ public class OpenAiClient implements LlmClient {
     private final OpenAIClient sdkClient;
     private final ProviderConfig config;
     private final String model;
-    private final String systemPrompt;
+    private String systemPrompt;
 
     public OpenAiClient(ProviderConfig cfg, String systemPrompt) {
         if (cfg.getApiKey() == null || cfg.getApiKey().isBlank()) {
@@ -74,6 +74,11 @@ public class OpenAiClient implements LlmClient {
     @Override
     public ProviderConfig config() {
         return config;
+    }
+
+    @Override
+    public void setSystemPrompt(String prompt) {
+        this.systemPrompt = prompt == null ? "" : prompt;
     }
 
     @Override

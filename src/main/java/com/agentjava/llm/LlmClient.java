@@ -37,6 +37,14 @@ public interface LlmClient {
     ProviderConfig config();
 
     /**
+     * 运行时覆盖系统提示词。
+     *
+     * 主要用于 Plan Mode：进入计划模式时把"只读/只规划"的指引拼到系统提示词后面，
+     * 退出时再还原。实现类自行保存并在下一次请求中生效。
+     */
+    void setSystemPrompt(String prompt);
+
+    /**
      * 按协议创建对应的客户端实现。
      *
      * @param cfg           provider 配置
