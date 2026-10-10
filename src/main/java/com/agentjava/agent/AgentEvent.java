@@ -1,6 +1,9 @@
 package com.agentjava.agent;
 
+import com.agentjava.permission.PermissionResponse;
+
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 
 /**
  * Agent 与 UI 之间的通信协议。
@@ -8,8 +11,6 @@ import java.util.Map;
  * 用 sealed interface 把事件类型锁死，用 record 定义每个事件。这样 Agent 完全
  * 不知道 UI 长什么样，UI 也不知道 Agent 内部跑了几轮循环——两边只通过这一条
  * 事件流解耦。switch 分发时编译器还能做穷举检查，漏掉哪个分支会直接报错。
- *
- * 这里只保留和 Agent Loop 相关的事件；权限请求、用户确认这类事件属于后续能力。
  */
 public sealed interface AgentEvent {
 
@@ -44,5 +45,14 @@ public sealed interface AgentEvent {
 
     /** 需要等待后重试（例如限流），UI 可以提示用户。 */
     record RetryEvent(String reason, long waitMs) implements AgentEvent {
+    }
+
+    /**
+     * 权限请求：工具执行前被权限系统拦下需用户确认时发出。
+     * Agent Loop 发出后阻塞在 {@code response} 这个 future 上，UI 渲染确认弹窗，
+     * 用户拍板后通过 future 回传 {@link PermissionResponse}，循环才继续。
+     */
+    record PermissionRequestEvent(String toolName, String description,
+                                 CompletableFuture<PermissionResponse> response) implements AgentEvent {
     }
 }

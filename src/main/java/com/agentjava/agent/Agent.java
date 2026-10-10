@@ -5,10 +5,14 @@ import com.agentjava.conversation.ToolResultBlock;
 import com.agentjava.conversation.ToolUseBlock;
 import com.agentjava.llm.LlmClient;
 import com.agentjava.llm.StreamEvent;
+import com.agentjava.permission.PermissionChecker;
+import com.agentjava.permission.PermissionMode;
 import com.agentjava.prompt.PlanModePrompt;
 import com.agentjava.tool.Tool;
 import com.agentjava.tool.ToolCategory;
 import com.agentjava.tool.ToolRegistry;
+
+import java.nio.file.Path;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -25,7 +29,8 @@ import java.util.concurrent.TimeUnit;
  * 所有进展通过 {@link AgentEvent} 队列推给 UI，Agent 本身完全不认识界面。
  *
  * 职责范围：Agent Loop + AgentEvent + 流式收集 + 工具分批执行 + Plan Mode。
- * 权限系统、上下文压缩、用户确认机制留待后续实现。
+ * 权限系统（PermissionChecker 五层防御）与 HITL 确认机制在此之上接入
+ * （权限请求事件 → UI 阻塞等待 → 回传决策），上下文压缩另行处理。
  */
 public class Agent {
 
@@ -39,6 +44,12 @@ public class Agent {
 
     private int maxIterations = 100;
     private boolean planMode = false;
+
+    /** 权限模式（默认 default：只读放行，写/命令需确认）。 */
+    private PermissionMode permissionMode = PermissionMode.DEFAULT;
+
+    /** 权限检查器；工作目录就绪后构建，权限模式变化时同步更新。 */
+    private PermissionChecker checker;
 
     public Agent(LlmClient client, ToolRegistry registry, String protocol, String baseSystemPrompt) {
         this.client = client;
@@ -59,9 +70,23 @@ public class Agent {
         return planMode;
     }
 
+    /** 设置权限模式；会同步到检查器。 */
+    public void setPermissionMode(PermissionMode mode) {
+        this.permissionMode = mode == null ? PermissionMode.DEFAULT : mode;
+        if (checker != null) {
+            checker.setMode(this.permissionMode);
+        }
+    }
+
+    public PermissionMode getPermissionMode() {
+        return permissionMode;
+    }
+
     /** 设置工作目录，供 Plan Mode 计算 plan 文件路径（默认 JVM user.dir）。 */
     public void setWorkDir(String workDir) {
         this.workDir = workDir;
+        this.checker = new PermissionChecker(permissionMode,
+                workDir != null ? Path.of(workDir) : null);
     }
 
     /**
@@ -204,8 +229,8 @@ public class Agent {
                     break;
                 }
 
-                // 执行工具：分批 + 只读并发
-                var executor = new StreamingExecutor(registry, queue);
+                // 执行工具：分批 + 只读并发，执行前经权限检查器逐层判定
+                var executor = new StreamingExecutor(registry, queue, checker);
                 var callInfos = toolCalls.stream()
                         .map(tc -> new StreamingExecutor.ToolCallInfo(tc.toolId(), tc.toolName(), tc.args()))
                         .toList();

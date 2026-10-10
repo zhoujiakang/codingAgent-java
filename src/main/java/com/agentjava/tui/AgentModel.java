@@ -5,6 +5,8 @@ import com.agentjava.agent.AgentEvent;
 import com.agentjava.config.ProviderConfig;
 import com.agentjava.conversation.ConversationManager;
 import com.agentjava.llm.LlmClient;
+import com.agentjava.permission.PermissionMode;
+import com.agentjava.permission.PermissionResponse;
 import com.agentjava.prompt.PlanModePrompt;
 import com.agentjava.prompt.PromptBuilder;
 import com.agentjava.tool.ToolRegistry;
@@ -22,6 +24,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CompletableFuture;
 
 /**
  * 主 TUI 模型。
@@ -57,6 +60,15 @@ public class AgentModel implements Model {
 
     /** Plan Mode 开关：开启后 Agent 只暴露只读工具，并注入"只规划不改动"的指引。 */
     private boolean planMode = false;
+
+    /** 权限模式：决定只读/写/命令各自的默认处置（见 PermissionMode 矩阵）。 */
+    private PermissionMode permissionMode = PermissionMode.DEFAULT;
+
+    /** 是否正在等待用户对一个权限请求的拍板（确认期间拦截普通输入）。 */
+    private boolean awaitingPermission = false;
+
+    /** 当前待决的权限请求 future；用户按键后由 UI 回传 PermissionResponse。 */
+    private CompletableFuture<PermissionResponse> pendingPermission;
 
     /** 本轮是否因错误收场，用于在 LoopComplete 时避免重复落地。 */
     private boolean agentErrored = false;
@@ -160,6 +172,10 @@ public class AgentModel implements Model {
     }
 
     private Command handleChatKey(KeyPressMessage key) {
+        // 权限确认弹窗优先于普通输入：此时 Agent Loop 阻塞在 future 上，等待用户拍板
+        if (awaitingPermission) {
+            return handlePermissionKey(key);
+        }
         if (streaming) {
             return Command.none();
         }
@@ -194,9 +210,14 @@ public class AgentModel implements Model {
         if (EXIT_COMMAND.equals(trimmed)) {
             return Command.quit();
         }
+        // 切换权限模式：/mode default|accept|plan|yolo
+        if (trimmed.startsWith("/mode")) {
+            return handleModeCommand(trimmed.substring(5).trim());
+        }
         // 切换 Plan Mode：/plan 只读只规划，/do 恢复正常工作模式
         if ("/plan".equals(trimmed)) {
             planMode = true;
+            permissionMode = PermissionMode.PLAN;
             String planPath = PlanModePrompt.getPlanPath(workingDir);
             conversation.addSystemReminder(
                     PlanModePrompt.buildReentryReminder(planPath));
@@ -204,6 +225,7 @@ public class AgentModel implements Model {
         }
         if ("/do".equals(trimmed)) {
             planMode = false;
+            permissionMode = PermissionMode.DEFAULT;
             String planPath = PlanModePrompt.getPlanPath(workingDir);
             conversation.addSystemReminder(
                     PlanModePrompt.buildExitReminder(planPath, PlanModePrompt.planExists(planPath)));
@@ -228,10 +250,67 @@ public class AgentModel implements Model {
         Agent agent = new Agent(llmClient, registry, activeProvider.normalizedProtocol(), systemPrompt);
         agent.setPlanMode(planMode);
         agent.setWorkDir(workingDir);
+        agent.setPermissionMode(permissionMode);
         agent.setMaxIterations(200);
         BlockingQueue<AgentEvent> queue = agent.run(conversation);
         Thread.startVirtualThread(() -> pumpAgentEvents(queue));
         return echo;
+    }
+
+    /** /mode 命令：切换权限模式（default / accept / plan / yolo）。 */
+    private Command handleModeCommand(String arg) {
+        return switch (arg) {
+            case "default" -> {
+                planMode = false;
+                permissionMode = PermissionMode.DEFAULT;
+                yield Command.println(Styles.ACCENT.render("✻ 权限模式: default（只读自动放行，写/命令需确认）"));
+            }
+            case "accept" -> {
+                planMode = false;
+                permissionMode = PermissionMode.ACCEPT_EDITS;
+                yield Command.println(Styles.ACCENT.render("✻ 权限模式: acceptEdits（写文件自动放行，命令需确认）"));
+            }
+            case "plan" -> {
+                planMode = true;
+                permissionMode = PermissionMode.PLAN;
+                conversation.addSystemReminder(
+                        PlanModePrompt.buildReentryReminder(PlanModePrompt.getPlanPath(workingDir)));
+                yield Command.println(Styles.ACCENT.render("✻ 权限模式: plan（同 default，仅规划不改动）"));
+            }
+            case "yolo" -> {
+                planMode = false;
+                permissionMode = PermissionMode.BYPASS;
+                yield Command.println(Styles.ERROR.render("⚠ 权限模式: bypass（跳过全部确认，仅黑名单生效，危险！）"));
+            }
+            default -> Command.println(Styles.ERROR.render("用法: /mode default|accept|plan|yolo"));
+        };
+    }
+
+    /** 用户在权限确认弹窗下的按键处理：y 允许 / a 始终允许 / n 拒绝。 */
+    private Command handlePermissionKey(KeyPressMessage key) {
+        String ch = "rune".equals(key.key()) ? String.valueOf(key.rune()) : key.key();
+        PermissionResponse resp;
+        if ("y".equalsIgnoreCase(ch)) {
+            resp = PermissionResponse.ALLOW;
+        } else if ("a".equalsIgnoreCase(ch)) {
+            resp = PermissionResponse.ALLOW_ALWAYS;
+        } else if ("n".equalsIgnoreCase(ch)) {
+            resp = PermissionResponse.DENY;
+        } else {
+            return Command.none();
+        }
+        var fut = this.pendingPermission;
+        this.awaitingPermission = false;
+        this.pendingPermission = null;
+        if (fut != null) {
+            fut.complete(resp);
+        }
+        String label = switch (resp) {
+            case ALLOW -> "允许";
+            case ALLOW_ALWAYS -> "始终允许（已写入本地规则）";
+            case DENY -> "拒绝";
+        };
+        return Command.println(Styles.ACCENT.render("✻ " + label));
     }
 
     /** 把 Agent 事件逐个投回事件循环；遇到终止事件就收工。 */
@@ -274,6 +353,14 @@ public class AgentModel implements Model {
             case AgentEvent.TurnComplete tc -> Command.none();
             case AgentEvent.RetryEvent re ->
                     Command.println(Styles.MUTED.render("↻ " + re.reason()));
+            // 权限请求：Agent Loop 已经阻塞在 future 上，这里弹出确认窗，等用户拍板
+            case AgentEvent.PermissionRequestEvent pre -> {
+                awaitingPermission = true;
+                pendingPermission = pre.response();
+                yield Command.println(
+                        Styles.ACCENT.render("⚠ 权限请求: " + pre.description())
+                                + Styles.MUTED.render("\n  (y) 允许 / (a) 始终允许 / (n) 拒绝"));
+            }
             // 整个循环结束：缓冲区落成最终回复
             case AgentEvent.LoopComplete lc -> finishTurn(streamBuf.toString());
             // 出错：展示错误，程序不退出
@@ -401,6 +488,12 @@ public class AgentModel implements Model {
         if (planMode) {
             left += Styles.ACCENT.render(" · PLAN");
         }
+        // 权限模式：default 不额外标注；accept/yolo 显式标出（plan 已由上方 PLAN 标出）
+        if (permissionMode == PermissionMode.ACCEPT_EDITS) {
+            left += Styles.ACCENT.render(" · ACCEPT");
+        } else if (permissionMode == PermissionMode.BYPASS) {
+            left += Styles.ERROR.render(" · BYPASS");
+        }
         String right = activeProvider == null ? "-" : activeProvider.getModel();
         if (usageAvailable) {
             right += " · ↑" + lastInputTokens + " ↓" + lastOutputTokens;
@@ -437,7 +530,7 @@ public class AgentModel implements Model {
     /** 启动后的一行就绪提示。 */
     private String renderReadyLine() {
         return Styles.ACCENT.render("✻ 已就绪")
-                + Styles.MUTED.render(" · " + EXIT_COMMAND + " 退出 · /plan 进入计划模式 · /do 退出计划模式");
+                + Styles.MUTED.render(" · " + EXIT_COMMAND + " 退出 · /mode 切换权限模式 · /plan 进入计划模式 · /do 退出");
     }
 
     private String separator() {

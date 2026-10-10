@@ -1,5 +1,8 @@
 package com.agentjava.agent;
 
+import com.agentjava.permission.PermissionChecker;
+import com.agentjava.permission.PermissionMode;
+import com.agentjava.permission.PermissionResponse;
 import com.agentjava.tool.Tool;
 import com.agentjava.tool.ToolCategory;
 import com.agentjava.tool.ToolRegistry;
@@ -9,6 +12,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
@@ -18,13 +22,15 @@ import java.util.concurrent.TimeUnit;
  * 分批策略是这里的核心——只读工具（READ）可以安全地并发跑，写文件和命令
  * 类工具一旦并发谁先落盘就说不准，所以各自独占一批、严格串行。
  *
- * 这里不做权限系统与 Hook，所以只保留"查找 → 执行 → 计时 → 回报"这一条
- * 最干净的管线；权限、Hook、上下文压缩等留待后续。
+ * 每执行一个工具前先过一遍 {@link PermissionChecker}：被拒绝（DENY）或用户拒绝
+ * 都包成 isError 的工具结果回灌给模型（不终止循环，让模型自己调整策略）；
+ * 需要确认（ASK）则发 {@link AgentEvent.PermissionRequestEvent} 并阻塞等待 UI 回复。
  */
 public class StreamingExecutor {
 
     private final ToolRegistry registry;
     private final BlockingQueue<AgentEvent> eventQueue;
+    private final PermissionChecker checker;
 
     public record ToolCallInfo(String toolId, String toolName, Map<String, Object> args) {
     }
@@ -32,9 +38,10 @@ public class StreamingExecutor {
     public record ToolExecResult(String toolId, String output, boolean isError) {
     }
 
-    public StreamingExecutor(ToolRegistry registry, BlockingQueue<AgentEvent> eventQueue) {
+    public StreamingExecutor(ToolRegistry registry, BlockingQueue<AgentEvent> eventQueue, PermissionChecker checker) {
         this.registry = registry;
         this.eventQueue = eventQueue;
+        this.checker = checker;
     }
 
     /**
@@ -95,13 +102,33 @@ public class StreamingExecutor {
         return batches;
     }
 
-    /** 单个工具执行管线：查找 → 执行 → 计时 → 回报 UI。 */
+    /** 单个工具执行管线：权限检查 → 查找 → 执行 → 计时 → 回报 UI。 */
     private ToolExecResult executeSingle(ToolCallInfo call) {
         Tool tool = registry.get(call.toolName());
         if (tool == null) {
             putSafe(new AgentEvent.ToolResultEvent(
                     call.toolId(), call.toolName(), "Unknown tool", true, 0));
             return new ToolExecResult(call.toolId(), "Error: unknown tool '" + call.toolName() + "'", true);
+        }
+
+        // 权限检查：被拒绝或用户拒绝都包成错误结果回灌，不终止循环
+        PermissionChecker.CheckResult check = checker.check(tool, call.args());
+        if (check.decision() == PermissionMode.Decision.DENY) {
+            String msg = "Permission denied: " + check.reason();
+            putSafe(new AgentEvent.ToolResultEvent(call.toolId(), call.toolName(), msg, true, 0));
+            return new ToolExecResult(call.toolId(), msg, true);
+        }
+        PermissionResponse response = (check.decision() == PermissionMode.Decision.ASK)
+                ? askUserPermission(call)
+                : PermissionResponse.ALLOW;
+        if (response == PermissionResponse.DENY) {
+            String msg = "User denied this operation";
+            putSafe(new AgentEvent.ToolResultEvent(call.toolId(), call.toolName(), msg, true, 0));
+            return new ToolExecResult(call.toolId(), msg, true);
+        }
+        if (response == PermissionResponse.ALLOW_ALWAYS) {
+            String content = checker.contentOf(call.toolName(), call.args());
+            checker.appendLocalRule(call.toolName(), PermissionChecker.buildAlwaysAllowPattern(call.toolName(), content));
         }
 
         long start = System.nanoTime();
@@ -116,6 +143,18 @@ public class StreamingExecutor {
         putSafe(new AgentEvent.ToolResultEvent(
                 call.toolId(), call.toolName(), result.output(), result.isError(), elapsed));
         return new ToolExecResult(call.toolId(), result.output(), result.isError());
+    }
+
+    /** 发出权限请求事件并阻塞等待 UI 回传；超时（5 分钟）视为拒绝。 */
+    private PermissionResponse askUserPermission(ToolCallInfo call) {
+        var future = new CompletableFuture<PermissionResponse>();
+        String desc = checker.describeToolAction(call.toolName(), call.args());
+        putSafe(new AgentEvent.PermissionRequestEvent(call.toolName(), desc, future));
+        try {
+            return future.get(5, TimeUnit.MINUTES);
+        } catch (Exception e) {
+            return PermissionResponse.DENY;
+        }
     }
 
     private void putSafe(AgentEvent event) {
