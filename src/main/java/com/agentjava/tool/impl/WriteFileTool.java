@@ -31,10 +31,12 @@ public class WriteFileTool implements Tool {
             Write content to a file, creating parent directories if needed. Overwrites existing files.
 
             Usage notes:
+            - 优先使用本工具代替 Bash 里的 echo > / tee。
             - If modifying an existing file, prefer EditFile over WriteFile — it only sends the diff.
             - Use this tool only to create new files or for complete rewrites.
             - You MUST read existing files with ReadFile before overwriting them.
-            - NEVER create documentation files (*.md) or README files unless explicitly requested.""";
+            - NEVER create documentation files (*.md) or README files unless explicitly requested.
+            - 多个无依赖的写入请求可以并行发起。""";
 
     @Override
     public String name() {

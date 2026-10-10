@@ -74,7 +74,8 @@ public class AgentJava {
         List<ProviderConfig> providers = config.getProviders();
         ProviderConfig cfg = providers.get(0);
         try {
-            LlmClient client = LlmClient.create(cfg, PromptBuilder.buildSystemPrompt(System.getProperty("user.dir")));
+            LlmClient client = LlmClient.create(cfg,
+                    PromptBuilder.buildSystemPrompt(PromptBuilder.detectEnvironment(cfg.getModel()), null));
             ToolRegistry registry = ToolRegistry.createDefault();
             List<Map<String, Object>> tools = registry.getAllSchemas(cfg.normalizedProtocol());
             ConversationManager conversation = new ConversationManager();

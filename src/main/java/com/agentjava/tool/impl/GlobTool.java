@@ -36,7 +36,8 @@ public class GlobTool implements Tool {
             - Supports patterns like "**/*.py", "src/**/*.ts", "*.go".
             - Search from "." or a specific path, never from "/".
             - Automatically skips .git, node_modules, __pycache__, and similar directories.
-            - Use this instead of find or ls commands via Bash.""";
+            - Use this instead of find or ls commands via Bash.
+            - 多个无依赖的查找请求可以并行发起。""";
 
     @Override
     public String name() {

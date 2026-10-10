@@ -49,7 +49,8 @@ public class GrepTool implements Tool {
             - Filter files with the include parameter (e.g., "*.py", "*.go").
             - Search from "." or a specific path, never from "/".
             - Use this instead of grep or rg commands via Bash.
-            - Automatically skips .git, node_modules, __pycache__, and similar directories.""";
+            - Automatically skips .git, node_modules, __pycache__, and similar directories.
+            - 多个无依赖的搜索请求可以并行发起。""";
 
     @Override
     public String name() {

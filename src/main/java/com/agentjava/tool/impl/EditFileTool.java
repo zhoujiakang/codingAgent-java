@@ -29,11 +29,13 @@ public class EditFileTool implements Tool {
             Replace an exact string in a file. The old_string must appear exactly once in the file.
 
             Usage notes:
+            - 优先使用本工具代替 Bash 里的 sed。
             - You MUST read the file with ReadFile before editing. This tool will fail otherwise.
             - When editing text from ReadFile output, preserve the exact indentation (tabs/spaces) as shown.
             - ALWAYS prefer editing existing files over creating new ones.
             - The edit will FAIL if old_string is not unique in the file. Provide more surrounding context to make it unique.
-            - The new_string must be different from old_string.""";
+            - The new_string must be different from old_string.
+            - 多个无依赖的编辑请求可以并行发起；存在先后顺序的编辑必须串行，否则会因文件未更新而失败。""";
 
     @Override
     public String name() {

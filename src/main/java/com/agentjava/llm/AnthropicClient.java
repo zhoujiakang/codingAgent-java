@@ -7,6 +7,7 @@ import com.anthropic.models.messages.ContentBlockParam;
 import com.anthropic.models.messages.MessageCreateParams;
 import com.anthropic.models.messages.MessageParam;
 import com.anthropic.models.messages.RawMessageStreamEvent;
+import com.anthropic.models.messages.CacheControlEphemeral;
 import com.anthropic.models.messages.TextBlockParam;
 import com.anthropic.models.messages.ThinkingConfigEnabled;
 import com.anthropic.models.messages.Tool;
@@ -105,9 +106,22 @@ public class AnthropicClient implements LlmClient {
         var paramsBuilder = MessageCreateParams.builder()
                 .model(model)
                 .maxTokens(DEFAULT_MAX_TOKENS)
-                // Anthropic 把 system 提到顶层参数，而不是塞进 messages（与 OpenAI 不同）
-                .system(systemPrompt)
+                // Anthropic 把 system 提到顶层参数，而不是塞进 messages（与 OpenAI 不同）。
+                // 给 system 块打上 cache_control: ephemeral，让它进入 Prompt Cache，
+                // Agent Loop 每轮 system 不变即可命中缓存，大幅降低 input token 成本。
                 .messages(buildMessages(conv.getMessages()));
+
+        if (!systemPrompt.isBlank()) {
+            paramsBuilder.systemOfTextBlockParams(List.of(
+                    TextBlockParam.builder()
+                            .text(systemPrompt)
+                            .cacheControl(CacheControlEphemeral.builder()
+                                    .type(JsonValue.from("ephemeral"))
+                                    .build())
+                            .build()));
+        } else {
+            paramsBuilder.system("");
+        }
 
         if (thinking) {
             paramsBuilder.thinking(ThinkingConfigEnabled.builder()
@@ -115,10 +129,13 @@ public class AnthropicClient implements LlmClient {
                     .build());
         }
 
-        // 把工具 schema 发给模型——这是 Function Calling 让模型"知道能调什么"的关键
+        // 把工具 schema 发给模型——这是 Function Calling 让模型"知道能调什么"的关键。
+        // 在最后一个工具上打 cache_control，缓存前缀（含 system + 此前所有工具），
+        // 工具列表稳定时也能命中缓存。
         if (tools != null && !tools.isEmpty()) {
-            for (var schema : tools) {
-                paramsBuilder.addTool(buildTool(schema));
+            int last = tools.size() - 1;
+            for (int i = 0; i < tools.size(); i++) {
+                paramsBuilder.addTool(buildTool(tools.get(i), i == last));
             }
         }
 
@@ -251,7 +268,7 @@ public class AnthropicClient implements LlmClient {
     }
 
     /** 把一个工具 schema（{name, description, input_schema}）转成 Anthropic 的 Tool 对象。 */
-    private Tool buildTool(Map<String, Object> schema) {
+    private Tool buildTool(Map<String, Object> schema, boolean cache) {
         var builder = Tool.builder().name((String) schema.get("name"));
         if (schema.containsKey("description")) {
             builder.description((String) schema.get("description"));
@@ -262,6 +279,12 @@ public class AnthropicClient implements LlmClient {
                 .type(JsonValue.from(inputSchema.getOrDefault("type", "object")))
                 .putAllAdditionalProperties(toJsonValueMap(inputSchema))
                 .build());
+        // 仅在最后一个工具上打断点：缓存前缀包含 system 与此前所有工具定义
+        if (cache) {
+            builder.cacheControl(CacheControlEphemeral.builder()
+                    .type(JsonValue.from("ephemeral"))
+                    .build());
+        }
         return builder.build();
     }
 

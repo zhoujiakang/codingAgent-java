@@ -45,6 +45,7 @@ public class BashTool implements Tool {
             - Optional timeout in seconds (max 600). Default is 120s.
             - Use && to chain sequential dependent commands. Use ; only when you don't care if earlier commands fail.
             - DO NOT use newlines to separate commands.
+            - 多个相互独立的命令可以并行发起多个 Bash 调用，减少 API 往返；存在依赖的命令用 && 串成一条。
 
             Git Safety Protocol:
             - NEVER run destructive git commands (push --force, reset --hard, checkout ., clean -f, branch -D) unless the user explicitly requests it.

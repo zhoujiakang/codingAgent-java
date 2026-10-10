@@ -65,6 +65,28 @@ public class ConversationManager {
         return m;
     }
 
+    /**
+     * 注入一条 system-reminder 消息。
+     *
+     * <p>用 {@code <system-reminder>} XML 标签把动态指令（Plan Mode 提醒、MCP Server 说明、
+     * 可用 Skill 列表等）包起来，以 user 角色发送。模型看到标签就知道这是系统补充指令，
+     * 而非用户对话，不会去「回复」它。
+     *
+     * <p>放在 messages 而不是 system 通道，是为了不破坏 system 字段的稳定性，
+     * 从而让 Prompt Cache 持续命中。{@link Message#toApiFormat(List)} 会把相邻的
+     * user 消息合并，所以注入点与真实用户消息拼成同一条也能正常工作。
+     *
+     * @param content 提醒正文（不含外层 {@code <system-reminder>} 标签）
+     */
+    public Message addSystemReminder(String content) {
+        String wrapped = "<system-reminder>\n"
+                + (content == null ? "" : content.strip())
+                + "\n</system-reminder>";
+        Message m = new Message(Message.Role.USER, wrapped, Message.Status.COMPLETE);
+        messages.add(m);
+        return m;
+    }
+
     /** 返回完整历史（内部消息模型，含元数据）。 */
     public List<Message> getMessages() {
         return messages;

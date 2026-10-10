@@ -29,11 +29,14 @@ public class ReadFileTool implements Tool {
             Read a file and return its contents with line numbers.
 
             Usage notes:
+            - 优先使用本工具，而不是 Bash 里的 cat / head / tail。
             - The file_path parameter should be an absolute path when possible.
             - By default reads up to 2000 lines from the beginning of the file.
             - Use offset and limit to read specific parts of large files. Only read what you need.
             - Results are returned with line numbers (1-based) for easy reference.
             - This tool can only read files, not directories. Use Glob to list directory contents.
+            - 多个相互独立的读取请求可以放在同一次响应里并行发起。
+            - 编辑文件前必须先 ReadFile 读过该文件，EditFile 才能正确匹配 old_string。
             - Do NOT re-read a file you just edited to verify — EditFile would have errored if the change failed.""";
 
     @Override

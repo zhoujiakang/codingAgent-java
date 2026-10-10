@@ -5,6 +5,7 @@ import com.agentjava.agent.AgentEvent;
 import com.agentjava.config.ProviderConfig;
 import com.agentjava.conversation.ConversationManager;
 import com.agentjava.llm.LlmClient;
+import com.agentjava.prompt.PlanModePrompt;
 import com.agentjava.prompt.PromptBuilder;
 import com.agentjava.tool.ToolRegistry;
 import com.agentjava.tui.tea.Ansi;
@@ -42,7 +43,7 @@ public class AgentModel implements Model {
 
     private final List<ProviderConfig> providers;
     private final String workingDir;
-    private final String systemPrompt;
+    private String systemPrompt;
     private final ConversationManager conversation = new ConversationManager();
 
     /** 工具注册中心：六个内置工具 + 共享的文件状态缓存。 */
@@ -82,7 +83,10 @@ public class AgentModel implements Model {
     public AgentModel(List<ProviderConfig> providers, String workingDir) {
         this.providers = List.copyOf(providers);
         this.workingDir = workingDir == null ? System.getProperty("user.dir") : workingDir;
-        this.systemPrompt = PromptBuilder.buildSystemPrompt(this.workingDir);
+        // 先用环境探测（此时 provider 未激活，model 未知）构建一次七模块 System Prompt；
+        // 激活 provider 拿到 model 后会用真实 model 重建，让 Environment 段落带上模型名。
+        this.systemPrompt = PromptBuilder.buildSystemPrompt(
+                PromptBuilder.detectEnvironment(null), null);
         // 只有一个 provider 时直接进入对话，多个时才让用户选（F2）
         if (this.providers.size() == 1) {
             this.state = AppState.CHAT;
@@ -193,10 +197,16 @@ public class AgentModel implements Model {
         // 切换 Plan Mode：/plan 只读只规划，/do 恢复正常工作模式
         if ("/plan".equals(trimmed)) {
             planMode = true;
+            String planPath = PlanModePrompt.getPlanPath(workingDir);
+            conversation.addSystemReminder(
+                    PlanModePrompt.buildReentryReminder(planPath));
             return Command.println(Styles.ACCENT.render("✻ 已进入 Plan Mode（只读，只规划不改动）"));
         }
         if ("/do".equals(trimmed)) {
             planMode = false;
+            String planPath = PlanModePrompt.getPlanPath(workingDir);
+            conversation.addSystemReminder(
+                    PlanModePrompt.buildExitReminder(planPath, PlanModePrompt.planExists(planPath)));
             return Command.println(Styles.ACCENT.render("✻ 已退出 Plan Mode，恢复正常工作模式"));
         }
 
@@ -217,6 +227,7 @@ public class AgentModel implements Model {
         // 把活儿交给 Agent：它在虚拟线程里跑 ReAct 主循环，事件回投到本事件循环
         Agent agent = new Agent(llmClient, registry, activeProvider.normalizedProtocol(), systemPrompt);
         agent.setPlanMode(planMode);
+        agent.setWorkDir(workingDir);
         agent.setMaxIterations(200);
         BlockingQueue<AgentEvent> queue = agent.run(conversation);
         Thread.startVirtualThread(() -> pumpAgentEvents(queue));
@@ -309,6 +320,9 @@ public class AgentModel implements Model {
     private void activateProvider(int index) {
         ProviderConfig cfg = providers.get(index);
         activeProvider = cfg;
+        // 用真实 model 重建 System Prompt（Environment 段落会带上模型名），再建客户端
+        this.systemPrompt = PromptBuilder.buildSystemPrompt(
+                PromptBuilder.detectEnvironment(cfg.getModel()), null);
         llmClient = LlmClient.create(cfg, systemPrompt);
     }
 

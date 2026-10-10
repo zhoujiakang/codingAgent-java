@@ -5,6 +5,7 @@ import com.agentjava.conversation.ToolResultBlock;
 import com.agentjava.conversation.ToolUseBlock;
 import com.agentjava.llm.LlmClient;
 import com.agentjava.llm.StreamEvent;
+import com.agentjava.prompt.PlanModePrompt;
 import com.agentjava.tool.Tool;
 import com.agentjava.tool.ToolCategory;
 import com.agentjava.tool.ToolRegistry;
@@ -28,11 +29,8 @@ import java.util.concurrent.TimeUnit;
  */
 public class Agent {
 
-    /** Plan Mode 下注入的系统提示词：引导模型只探索、只规划、不改动。 */
-    private static final String PLAN_MODE_REMINDER = """
-            [Plan Mode] 你当前处于计划模式。只能进行探索与分析（读取文件、搜索代码、浏览项目结构），
-            并把实现计划清晰地输出给用户。不要调用任何写操作或命令执行类工具——它们已经被禁用。
-            规划完成后，用文字把方案讲清楚，等用户确认后再真正动手。""";
+    /** Plan Mode 下计算 plan 文件路径时使用的工作目录；为 null 时退回 JVM 的 user.dir。 */
+    private String workDir;
 
     private final LlmClient client;
     private final ToolRegistry registry;
@@ -59,6 +57,11 @@ public class Agent {
 
     public boolean isPlanMode() {
         return planMode;
+    }
+
+    /** 设置工作目录，供 Plan Mode 计算 plan 文件路径（默认 JVM user.dir）。 */
+    public void setWorkDir(String workDir) {
+        this.workDir = workDir;
     }
 
     /**
@@ -96,14 +99,21 @@ public class Agent {
                     break;
                 }
 
-                // Plan Mode：工具只暴露只读类，并用系统提示词引导模型只规划不改动
+                // Plan Mode：工具只暴露只读类（硬约束），且通过 system-reminder 按轮次
+                // 注入提醒（软约束）。System Prompt 本身保持不变，以便 Prompt Cache 持续命中。
                 List<Tool> tools = planMode
                         ? registry.listTools().stream()
                         .filter(t -> t.category() == ToolCategory.READ)
                         .toList()
                         : registry.listTools();
                 var schemas = registry.schemasOf(tools, protocol);
-                client.setSystemPrompt(planMode ? baseSystemPrompt + "\n\n" + PLAN_MODE_REMINDER : baseSystemPrompt);
+                client.setSystemPrompt(baseSystemPrompt);
+
+                if (planMode) {
+                    String planPath = PlanModePrompt.getPlanPath(workDir);
+                    boolean exists = PlanModePrompt.planExists(planPath);
+                    conv.addSystemReminder(PlanModePrompt.buildReminder(planPath, exists, iteration));
+                }
 
                 // 调 LLM，拿事件队列
                 var streamQueue = client.stream(conv, schemas);
