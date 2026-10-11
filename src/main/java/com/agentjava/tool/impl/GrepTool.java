@@ -1,5 +1,6 @@
 package com.agentjava.tool.impl;
 
+import com.agentjava.tool.CwdContext;
 import com.agentjava.tool.Tool;
 import com.agentjava.tool.ToolCategory;
 import com.agentjava.tool.ToolResult;
@@ -97,7 +98,8 @@ public class GrepTool implements Tool {
             return ToolResult.error("Error: pattern is required");
         }
 
-        Path root = Path.of(basePath);
+        // Worktree：相对路径以当前工作目录为基解析，绝对路径原样使用
+        Path root = CwdContext.resolve(Path.of(basePath));
         if (!Files.exists(root) || !Files.isDirectory(root)) {
             return ToolResult.error("Error: path not found: " + basePath);
         }

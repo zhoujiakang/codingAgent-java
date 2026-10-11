@@ -1,5 +1,6 @@
 package com.agentjava.tool.impl;
 
+import com.agentjava.tool.CwdContext;
 import com.agentjava.tool.FileStateCache;
 import com.agentjava.tool.Tool;
 import com.agentjava.tool.ToolCategory;
@@ -81,7 +82,8 @@ public class ReadFileTool implements Tool {
         int offset = intArg(args, "offset", 0);
         int limit = intArg(args, "limit", 2000);
 
-        Path path = Path.of(filePath);
+        // Worktree：相对路径以当前工作目录为基解析，绝对路径原样使用
+        Path path = CwdContext.resolve(Path.of(filePath));
 
         if (!Files.exists(path)) {
             return ToolResult.error("Error: file not found: " + filePath);

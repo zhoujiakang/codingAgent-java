@@ -35,6 +35,9 @@ import com.agentjava.subagent.AgentLoader;
 import com.agentjava.subagent.AgentTool;
 import com.agentjava.subagent.SubAgentTaskManager;
 import com.agentjava.subagent.TraceRegistry;
+import com.agentjava.worktree.WorktreeManager;
+import com.agentjava.worktree.WorktreeSession;
+import com.agentjava.worktree.WorktreeSessionStore;
 import com.agentjava.skill.SkillExecutor;
 import com.agentjava.skill.SkillForkHost;
 import com.agentjava.tool.ToolRegistry;
@@ -48,6 +51,7 @@ import com.agentjava.tui.tea.Program;
 import com.agentjava.tui.tea.UpdateResult;
 import com.agentjava.tui.tea.WindowSizeMessage;
 
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -115,6 +119,15 @@ public class AgentModel implements Model, UIController {
 
     private final List<ProviderConfig> providers;
     private final String workingDir;
+
+    /** Worktree 管理器（repoRoot = workingDir）。 */
+    private WorktreeManager worktreeManager;
+
+    /**
+     * 当前已进入的 Worktree 路径；为 null 表示还在主目录。
+     * 进入后主 Agent 与子 Agent 的 workDir 都退回它，工具据此显式取 cwd。
+     */
+    private String activeWorktree = null;
     private String systemPrompt;
     private final ConversationManager conversation = new ConversationManager();
 
@@ -596,6 +609,20 @@ public class AgentModel implements Model, UIController {
         agentTool.setParentConversation(conversation);
         agentTool.setWorkDir(workingDir);
         registry.register(agentTool);
+
+        // Worktree：管理器以 workingDir 为 repoRoot，过期清理阈值 24 小时
+        worktreeManager = new WorktreeManager(workingDir, List.of(), 24);
+        agentTool.setWorktreeManager(worktreeManager);
+        // 启动时尝试从会话文件恢复已进入的 Worktree（--resume 支持）
+        tryRestoreWorktreeSession();
+
+        // /worktree 命令：list / create / enter / exit / remove 五个子命令
+        commands.register(new com.agentjava.command.Command(
+                "worktree", "Git Worktree：并行隔离的工作目录", new String[]{},
+                CommandType.LOCAL, "/worktree [list|create <name>|enter <name>|exit|remove <name>]",
+                "用法：/worktree list · /worktree create <名字> · /worktree enter <名字> · "
+                        + "/worktree exit · /worktree remove <名字> [--discard-changes]",
+                this::handleWorktree));
 
         var names = AgentLoader.listNames(loaded.definitions());
         agentStatus = Styles.ACCENT.render("✻ 子 Agent：" + names.size() + " 个可用（"
@@ -1337,7 +1364,7 @@ public class AgentModel implements Model, UIController {
         // 把活儿交给 Agent：它在虚拟线程里跑 ReAct 主循环，事件回投到本事件循环
         Agent agent = new Agent(llmClient, registry, activeProvider.normalizedProtocol(), systemPrompt);
         agent.setPlanMode(planMode);
-        agent.setWorkDir(workingDir);
+        agent.setWorkDir(currentWorkDir());
         agent.setPermissionMode(permissionMode);
         agent.setMaxIterations(200);
         agent.setContextWindow(contextWindow);
@@ -1351,6 +1378,7 @@ public class AgentModel implements Model, UIController {
             agentTool.setSessionId(sessionId);
             agentTool.setPermissionMode(permissionMode);
             agentTool.setHookEngine(hookEngine);
+            agentTool.setWorkDir(currentWorkDir());
         }
         BlockingQueue<AgentEvent> queue = agent.run(conversation);
         Thread.startVirtualThread(() -> pumpAgentEvents(queue));
@@ -1363,6 +1391,152 @@ public class AgentModel implements Model, UIController {
      * <p>全部按需包成 Supplier：provider 可能还没激活、工具数量可能因为 MCP 接入而变化，
      * 用函数式取值保证命令读到的永远是「当下」，而不是建 ctx 那一刻的快照。
      */
+    /**
+     * 当前生效的工作目录：已进入 Worktree 时用 Worktree 路径，否则用项目根目录。
+     * 主 Agent 与子 Agent 都从它取 cwd（工具再据此显式解析路径），不改进程级 cwd。
+     */
+    private String currentWorkDir() {
+        return activeWorktree != null ? activeWorktree : workingDir;
+    }
+
+    /**
+     * 启动时尝试恢复上次会话里已进入的 Worktree（--resume 支持）。
+     * 仅当会话文件存在且对应目录仍在时才恢复；否则清掉陈旧的会话文件。
+     */
+    private void tryRestoreWorktreeSession() {
+        try {
+            var opt = WorktreeSessionStore.load(workingDir);
+            if (opt.isEmpty()) {
+                return;
+            }
+            WorktreeSession s = opt.get();
+            if (s.isActive() && Files.isDirectory(Path.of(s.worktreePath()))) {
+                activeWorktree = s.worktreePath();
+            } else {
+                WorktreeSessionStore.save(workingDir, null);
+            }
+        } catch (Exception ignored) {
+            // 恢复失败不阻断启动
+        }
+    }
+
+    /** {@code /worktree}：Git Worktree 的 list / create / enter / exit / remove 五个子命令。 */
+    private String handleWorktree(CommandContext ctx) {
+        if (worktreeManager == null) {
+            return "（Worktree 模块未初始化）";
+        }
+        String args = ctx.args() == null ? "" : ctx.args().strip();
+        if (args.isEmpty()) {
+            return worktreeHelp();
+        }
+        String[] parts = args.split("\\s+", 2);
+        String sub = parts[0].toLowerCase(Locale.ROOT);
+        String rest = parts.length > 1 ? parts[1].strip() : "";
+
+        switch (sub) {
+            case "list" -> {
+                var list = worktreeManager.list();
+                if (list.isEmpty()) {
+                    return "（还没有 Worktree；用 /worktree create <名字> 创建一个）";
+                }
+                var sb = new StringBuilder("Worktree 列表（").append(list.size()).append(" 个）：\n");
+                for (var w : list) {
+                    sb.append("  ").append(w.path())
+                            .append(w.branch().isBlank() ? "" : "  [" + w.branch() + "]")
+                            .append('\n');
+                }
+                if (activeWorktree != null) {
+                    sb.append("\n当前已进入：").append(activeWorktree).append('\n');
+                }
+                return sb.toString();
+            }
+            case "create" -> {
+                if (rest.isEmpty()) {
+                    return "用法：/worktree create <名字>（名字会同时用作目录名和分支名 worktree-<名字>）";
+                }
+                try {
+                    var info = worktreeManager.create(rest, "HEAD");
+                    return "已创建 Worktree：\n  路径：" + info.path() + "\n  分支：" + info.branch()
+                            + "\n（手动创建的 Worktree 不会被自动清理；用 /worktree enter 切换过去，"
+                            + "或 /worktree remove 删除）";
+                } catch (IllegalArgumentException e) {
+                    return Styles.ERROR.render("✗ " + e.getMessage());
+                }
+            }
+            case "enter" -> {
+                if (rest.isEmpty()) {
+                    return "用法：/worktree enter <名字>";
+                }
+                String flat = com.agentjava.worktree.SlugValidator.flatten(rest);
+                Path target = worktreeManager.worktreeDir().resolve(flat).toAbsolutePath().normalize();
+                if (!Files.isDirectory(target)) {
+                    return Styles.ERROR.render("✗ Worktree 不存在："
+                            + rest + "（请先用 /worktree create 创建）");
+                }
+                String branch = com.agentjava.worktree.SlugValidator.branchName(rest);
+                String origBranch = git(workingDir, "rev-parse", "--abbrev-ref", "HEAD");
+                String origHead = git(workingDir, "rev-parse", "HEAD");
+                var session = new WorktreeSession(workingDir, target.toString(), rest, branch,
+                        origBranch == null ? "" : origBranch,
+                        origHead == null ? "" : origHead, sessionId, 0);
+                try {
+                    WorktreeSessionStore.save(workingDir, session);
+                } catch (java.io.IOException e) {
+                    return Styles.ERROR.render("✗ 会话持久化失败：" + e.getMessage());
+                }
+                activeWorktree = target.toString();
+                return "已进入 Worktree「" + rest + "」→ " + target
+                        + "\n（后续文件操作都发生在隔离副本里；/worktree exit 退出）";
+            }
+            case "exit" -> {
+                if (activeWorktree == null) {
+                    return "（当前不在任何 Worktree 里）";
+                }
+                try {
+                    WorktreeSessionStore.save(workingDir, null);
+                } catch (java.io.IOException e) {
+                    return Styles.ERROR.render("✗ 会话清除失败：" + e.getMessage());
+                }
+                activeWorktree = null;
+                return "已退出 Worktree，回到主目录：" + workingDir;
+            }
+            case "remove" -> {
+                if (rest.isEmpty()) {
+                    return "用法：/worktree remove <名字> [--discard-changes]（有未提交修改时需加 --discard-changes）";
+                }
+                boolean discard = rest.contains("--discard-changes");
+                String name = rest.replace("--discard-changes", "").strip();
+                try {
+                    worktreeManager.remove(name, "remove", discard);
+                    return "已删除 Worktree：" + name;
+                } catch (IllegalArgumentException e) {
+                    return Styles.ERROR.render("✗ " + e.getMessage());
+                } catch (IllegalStateException e) {
+                    return Styles.ERROR.render("✗ " + e.getMessage()
+                            + "（加 --discard-changes 可强制删除）");
+                }
+            }
+            default -> {
+                return Styles.ERROR.render("✗ 未知子命令：/worktree " + sub + "\n") + worktreeHelp();
+            }
+        }
+    }
+
+    /** 在指定 cwd 下跑一条 git 命令，返回 stdout（失败返回 null）。 */
+    private String git(String cwd, String... args) {
+        return com.agentjava.worktree.GitUtil.run(cwd, args);
+    }
+
+    /** /worktree 的用法说明。 */
+    private String worktreeHelp() {
+        return "Git Worktree 子命令：\n"
+                + "  /worktree list                       列出所有 Worktree\n"
+                + "  /worktree create <名字>              新建一个 Worktree（不会被自动清理）\n"
+                + "  /worktree enter <名字>               切换到该 Worktree 工作\n"
+                + "  /worktree exit                       退出当前 Worktree，回到主目录\n"
+                + "  /worktree remove <名字> [--discard-changes]  删除 Worktree";
+    }
+
     private CommandContext buildCommandContext(String args) {
         return new CommandContext(
                 args == null ? "" : args,

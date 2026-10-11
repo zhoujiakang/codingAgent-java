@@ -6,6 +6,8 @@ import com.agentjava.conversation.Message;
 import com.agentjava.hook.HookEngine;
 import com.agentjava.llm.LlmClient;
 import com.agentjava.permission.PermissionMode;
+import com.agentjava.worktree.AgentWorktree;
+import com.agentjava.worktree.WorktreeManager;
 import com.agentjava.tool.Tool;
 import com.agentjava.tool.ToolCategory;
 import com.agentjava.tool.ToolRegistry;
@@ -91,6 +93,9 @@ public class AgentTool implements Tool {
     private TraceRegistry trace;
     private ConversationManager parentConversation;
 
+    /** Worktree 管理器：isolation=worktree 时用于创建/清理隔离副本。 */
+    private WorktreeManager worktreeManager;
+
     /** 本工具实例的生成上下文；Fork 子 Agent 里的实例被标成 {@link #FORK_QUERY_SOURCE}。 */
     private volatile String querySource = "";
 
@@ -166,6 +171,10 @@ public class AgentTool implements Tool {
 
     public void setTaskManager(SubAgentTaskManager taskManager) {
         this.taskManager = taskManager;
+    }
+
+    public void setWorktreeManager(WorktreeManager worktreeManager) {
+        this.worktreeManager = worktreeManager;
     }
 
     public SubAgentTaskManager getTaskManager() {
@@ -293,7 +302,7 @@ public class AgentTool implements Tool {
         properties.put("isolation", Map.of(
                 "type", "string",
                 "enum", List.of("worktree"),
-                "description", "文件系统隔离模式；worktree 尚未实现"));
+                "description", "文件系统隔离模式：worktree 把子 Agent 放进独立的 Git 工作树中运行"));
 
         Map<String, Object> inputSchema = new LinkedHashMap<>();
         inputSchema.put("type", "object");
@@ -317,15 +326,24 @@ public class AgentTool implements Tool {
         if (description == null || description.isBlank() || prompt == null || prompt.isBlank()) {
             return ToolResult.error("Error: description 和 prompt 都是必填参数");
         }
-        String isolation = str(safeArgs, "isolation");
-        if ("worktree".equalsIgnoreCase(isolation)) {
-            return ToolResult.error("Error: isolation=worktree 尚未实现（Worktree 文件系统隔离），"
-                    + "本次调用没有派发。去掉 isolation 参数即可正常执行。");
-        }
         String subagentType = str(safeArgs, "subagent_type");
         String modelOverride = str(safeArgs, "model");
         String agentName = str(safeArgs, "name");
 
+        String isolation = str(safeArgs, "isolation");
+        if ("worktree".equalsIgnoreCase(isolation)) {
+            // isolation=worktree：把子 Agent 放进独立的 Git Worktree 里跑
+            if (subagentType == null || subagentType.isBlank()) {
+                subagentType = AgentDefinition.GENERAL_PURPOSE.agentType();
+            }
+            AgentDefinition def = resolveSpec(subagentType);
+            if (def == null) {
+                return ToolResult.error("Error: 未知的 subagent_type '" + subagentType
+                        + "'。可用：" + String.join(", ", AgentLoader.listNames(agentDefs)));
+            }
+            boolean background = Boolean.TRUE.equals(safeArgs.get("run_in_background"));
+            return runDefinitionWithWorktree(def, description, prompt, modelOverride, agentName, background);
+        }
         // 留空 subagent_type → Fork 路径
         if (subagentType == null || subagentType.isBlank()) {
             return runFork(description, prompt, modelOverride);
@@ -397,6 +415,83 @@ public class AgentTool implements Tool {
                     + "）。完成后结果会通过 task-notification 回传，你可以先继续做别的事。");
         }
         return awaitAndReport(taskId, head);
+    }
+
+    // ───────────────────────── Worktree 隔离路径 ─────────────────────────
+
+    /**
+     * isolation=worktree：把子 Agent 放进独立 Git Worktree 里跑。
+     *
+     * <p>生命周期：创建 Worktree → 注入上下文通知（告知子 Agent 它在隔离副本中，
+     * 父目录传来的路径需翻译）→ 以 Worktree 路径作为子 Agent 的 workDir 启动
+     * （工具靠线程局部 cwd 显式取路径，不改进程 cwd）→ 完成后自动清理。
+     * 自动清理在链路追踪的监听里触发，所以前台/后台两种路径都能覆盖：无变更就删掉，
+     * 有变更就保留并把路径+分支追加到返回结果，让主 Agent 去 review。
+     */
+    private ToolResult runDefinitionWithWorktree(AgentDefinition def, String description,
+                                                 String prompt, String modelOverride,
+                                                 String agentName, boolean background) {
+        if (worktreeManager == null) {
+            return ToolResult.error("Error: Worktree 管理器未初始化，无法使用 isolation=worktree");
+        }
+        if (client == null) {
+            return ToolResult.error("Error: 还没有可用的 provider，无法启动子 Agent");
+        }
+
+        // 1) 创建隔离副本（自动生成 ephemeral 名称，可被后台清理回收）
+        AgentWorktree.Result wt;
+        try {
+            wt = AgentWorktree.create(worktreeManager, "HEAD");
+        } catch (RuntimeException e) {
+            return ToolResult.error("Error: 创建 Worktree 失败：" + e.getMessage());
+        }
+
+        // 2) 注入上下文通知，让子 Agent 知道自己在隔离副本里
+        String notice = AgentWorktree.buildNotice(workDir, wt.worktreePath());
+        String isolatedPrompt = notice + "\n\n" + prompt;
+
+        LlmClient subClient = selectClient(def.model(), modelOverride);
+        ToolRegistry subRegistry = ToolFilter.filterForAgent(parentRegistry, def, background);
+        String label = (agentName == null || agentName.isBlank()) ? description : agentName;
+        String taskId = taskManager.createTask(truncate(label, 50), def.agentType());
+
+        // 自动清理：在子 Agent 结束时触发（前台/后台都走这里），结果存进 cleanup[]
+        String[] cleanup = {null};
+        Consumer<AgentEvent> baseListener = trace == null ? null
+                : ev -> trace.onEvent(taskId, ev);
+        Consumer<AgentEvent> listener = ev -> {
+            if (baseListener != null) {
+                baseListener.accept(ev);
+            }
+            if (ev instanceof AgentEvent.LoopComplete || ev instanceof AgentEvent.ErrorEvent) {
+                try {
+                    cleanup[0] = AgentWorktree.autoCleanup(
+                            wt.worktreePath(), wt.worktreeBranch(), wt.headCommit(), wt.gitRoot());
+                } catch (RuntimeException ignored) {
+                    // 清理失败不阻断主流程
+                }
+            }
+        };
+
+        var req = new SubAgentTaskManager.SpawnRequest(
+                subClient, subRegistry, protocol, baseSystemPrompt, wt.worktreePath(),
+                def.permissionMode() == null ? permissionMode : def.permissionMode(),
+                hookEngine, sessionId, def.systemPrompt(), isolatedPrompt, null,
+                def.agentType(), def.effectiveMaxTurns(), listener);
+        taskManager.launch(taskId, req);
+
+        String head = "子 Agent \"%s\"（%s，worktree 隔离）".formatted(description, def.agentType());
+        if (background) {
+            return ToolResult.success(head + "已在后台启动（任务 " + taskId
+                    + "），工作目录为隔离副本 " + wt.worktreePath()
+                    + "。完成后结果会通过 task-notification 回传。");
+        }
+        ToolResult r = awaitAndReport(taskId, head);
+        // 前台等待结束时，清理已在监听里跑完，把结果说明追加回去
+        if (cleanup[0] != null && !cleanup[0].isBlank()) {
+            return new ToolResult(r.output() + cleanup[0], r.isError());
+        }
+        return r;
     }
 
     // ───────────────────────── Fork 路径 ─────────────────────────

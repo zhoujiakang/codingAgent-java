@@ -6,6 +6,7 @@ import com.agentjava.hook.HookEngine;
 import com.agentjava.permission.PermissionChecker;
 import com.agentjava.permission.PermissionMode;
 import com.agentjava.permission.PermissionResponse;
+import com.agentjava.tool.CwdContext;
 import com.agentjava.tool.Tool;
 import com.agentjava.tool.ToolCategory;
 import com.agentjava.tool.ToolRegistry;
@@ -51,6 +52,9 @@ public class StreamingExecutor {
     /** Hook 引擎；没配置 Hook 时为 null，所有插入点自动退化成空操作。 */
     private final HookEngine hookEngine;
 
+    /** 当前 Agent 的工作目录；进入 Worktree 后会变成 Worktree 路径，供工具显式取 cwd 用。 */
+    private final String workDir;
+
     public record ToolCallInfo(String toolId, String toolName, Map<String, Object> args) {
     }
 
@@ -58,15 +62,21 @@ public class StreamingExecutor {
     }
 
     public StreamingExecutor(ToolRegistry registry, BlockingQueue<AgentEvent> eventQueue, PermissionChecker checker) {
-        this(registry, eventQueue, checker, null);
+        this(registry, eventQueue, checker, null, null);
     }
 
     public StreamingExecutor(ToolRegistry registry, BlockingQueue<AgentEvent> eventQueue,
                              PermissionChecker checker, HookEngine hookEngine) {
+        this(registry, eventQueue, checker, hookEngine, null);
+    }
+
+    public StreamingExecutor(ToolRegistry registry, BlockingQueue<AgentEvent> eventQueue,
+                             PermissionChecker checker, HookEngine hookEngine, String workDir) {
         this.registry = registry;
         this.eventQueue = eventQueue;
         this.checker = checker;
         this.hookEngine = hookEngine;
+        this.workDir = workDir;
     }
 
     /**
@@ -171,10 +181,17 @@ public class StreamingExecutor {
 
         long start = System.nanoTime();
         ToolResult result;
+        // Worktree：把当前 Agent 的 workDir 临时挂到线程局部上，让工具在显式 cwd 下执行。
+        // READ 批次是并发跑在多条虚拟线程上的，每一条都各自取到自己的 cwd，互不干扰。
+        // 用 try/finally 还原，避免把本 Agent 的 cwd 泄漏到其它调用。
+        String prevCwd = CwdContext.get();
+        CwdContext.set(this.workDir);
         try {
             result = tool.execute(call.args());
         } catch (Exception e) {
             result = ToolResult.error("Tool execution error: " + e.getMessage());
+        } finally {
+            CwdContext.set(prevCwd);
         }
         double elapsed = (System.nanoTime() - start) / 1_000_000_000.0;
 

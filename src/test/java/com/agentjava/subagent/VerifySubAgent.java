@@ -270,7 +270,7 @@ class VerifySubAgent {
 
         // 3) 定义层白名单取交集
         var whitelist = new AgentDefinition("w", "白名单", List.of("ReadFile", "Grep"), List.of(),
-                null, 0, null, null, null, AgentDefinition.SOURCE_PROJECT);
+                null, 0, null, null, null, AgentDefinition.SOURCE_PROJECT, null);
         var filtered = ToolFilter.filterForAgent(registry, whitelist);
         assertEquals(2, filtered.listTools().size());
         assertNotNull(filtered.get("ReadFile"));
@@ -278,12 +278,12 @@ class VerifySubAgent {
 
         // 4) 白名单只有 * 时跳过交集，等价于「不限制」
         var star = new AgentDefinition("s", "星号", List.of("*"), List.of(),
-                null, 0, null, null, null, AgentDefinition.SOURCE_PROJECT);
+                null, 0, null, null, null, AgentDefinition.SOURCE_PROJECT, null);
         assertEquals(7, ToolFilter.filterForAgent(registry, star).listTools().size());
 
         // 5) 定义层黑名单：在白名单之外再排除
         var blacklist = new AgentDefinition("b", "黑名单", List.of(), List.of("Bash"),
-                null, 0, null, null, null, AgentDefinition.SOURCE_PROJECT);
+                null, 0, null, null, null, AgentDefinition.SOURCE_PROJECT, null);
         assertNull(ToolFilter.filterForAgent(registry, blacklist).get("Bash"));
     }
 
@@ -493,7 +493,7 @@ class VerifySubAgent {
     // ───────────────────────── 六、参数校验与边界 ─────────────────────────
 
     @Test
-    @DisplayName("参数校验：必填项、未知类型、未实现的 worktree 隔离各给明确错误")
+    @DisplayName("参数校验：必填项、未知类型、已实现的 worktree 隔离被识别")
     void argumentValidation() {
         var tool = newTool(builtins(), new FakeClient("x", null, false));
 
@@ -506,11 +506,12 @@ class VerifySubAgent {
         assertTrue(unknown.output().contains("未知的 subagent_type"));
         assertTrue(unknown.output().contains("general-purpose"));
 
+        // worktree 隔离已实现：isolation=worktree 现在被识别为合法模式，
+        // 不再是「未实现」的占位错误。测试脚手架没注入 WorktreeManager，因此给出明确的
+        // 「未初始化」提示，而不是崩溃或静默走 Fork 路径。
         var worktree = tool.execute(Map.of("description", "d", "prompt", "p", "isolation", "worktree"));
         assertTrue(worktree.isError());
-        assertTrue(worktree.output().contains("Worktree 文件系统隔离"));
-        // 明确告诉模型「这次没有派发」，避免它以为任务在跑
-        assertTrue(worktree.output().contains("没有派发"));
+        assertTrue(worktree.output().contains("Worktree 管理器"));
     }
 
     @Test
@@ -518,7 +519,7 @@ class VerifySubAgent {
     void toolContract() {
         var defs = builtins();
         defs.put("reviewer", new AgentDefinition("reviewer", "安全审查", List.of(), List.of(),
-                null, 0, null, null, null, AgentDefinition.SOURCE_PROJECT));
+                null, 0, null, null, null, AgentDefinition.SOURCE_PROJECT, null));
         var tool = newTool(defs, new FakeClient("x", null, false));
 
         assertEquals("Agent", tool.name());

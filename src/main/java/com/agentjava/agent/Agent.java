@@ -325,7 +325,7 @@ public class Agent {
                 }
 
                 // 执行工具：分批 + 只读并发，执行前经权限检查器逐层判定
-                var executor = new StreamingExecutor(registry, queue, checker, hookEngine);
+                var executor = new StreamingExecutor(registry, queue, checker, hookEngine, workDir);
                 var callInfos = toolCalls.stream()
                         .map(tc -> new StreamingExecutor.ToolCallInfo(tc.toolId(), tc.toolName(), tc.args()))
                         .toList();

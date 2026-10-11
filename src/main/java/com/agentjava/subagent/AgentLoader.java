@@ -174,6 +174,7 @@ public final class AgentLoader {
         List<String> disallowedTools = List.of();
         String model = null;
         String permissionMode = null;
+        String isolation = null;
         int maxTurns = 0;
 
         if (yamlBlock != null && !yamlBlock.isEmpty()) {
@@ -188,6 +189,7 @@ public final class AgentLoader {
                 if (permissionMode == null) {
                     permissionMode = string(frontmatter, "permission_mode");
                 }
+                isolation = string(frontmatter, "isolation");
                 Object rawMaxTurns = frontmatter.get("maxTurns");
                 if (rawMaxTurns == null) {
                     rawMaxTurns = frontmatter.get("max_turns");
@@ -215,7 +217,8 @@ public final class AgentLoader {
         return new AgentDefinition(name, description.strip(), tools, disallowedTools, model, maxTurns,
                 AgentDefinition.parsePermissionMode(permissionMode),
                 body.isEmpty() ? null : body,
-                path.toString(), source);
+                path.toString(), source,
+                isolation);
     }
 
     private static String string(Map<String, Object> map, String key) {

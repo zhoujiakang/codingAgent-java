@@ -37,7 +37,11 @@ public record AgentDefinition(String agentType,
                               PermissionMode permissionMode,
                               String systemPrompt,
                               String filePath,
-                              String source) {
+                              String source,
+                              String isolation) {
+
+    /** 文件系统隔离模式：worktree（Git 工作树隔离）。为 null 表示不隔离。 */
+    public static final String ISOLATION_WORKTREE = "worktree";
 
     /** 定义里没写 maxTurns 时的兜底轮数。 */
     public static final int DEFAULT_MAX_TURNS = 200;
@@ -99,7 +103,8 @@ public record AgentDefinition(String agentType,
             null,
             GENERAL_PURPOSE_PROMPT,
             null,
-            SOURCE_BUILTIN);
+            SOURCE_BUILTIN,
+            null);
 
     /**
      * 计划 Agent：只读规划，15 轮上限。
@@ -118,7 +123,8 @@ public record AgentDefinition(String agentType,
             null,
             PLAN_PROMPT,
             null,
-            SOURCE_BUILTIN);
+            SOURCE_BUILTIN,
+            null);
 
     /**
      * 探索 Agent：只读搜索，30 轮上限，用 haiku 小模型。
@@ -137,13 +143,21 @@ public record AgentDefinition(String agentType,
             null,
             EXPLORE_PROMPT,
             null,
-            SOURCE_BUILTIN);
+            SOURCE_BUILTIN,
+            null);
 
     public AgentDefinition {
         tools = tools == null ? List.of() : List.copyOf(tools);
         disallowedTools = disallowedTools == null ? List.of() : List.copyOf(disallowedTools);
         if (maxTurns < 0) {
             maxTurns = 0;
+        }
+        // isolation 归一化：空白 → null，其余转小写，便于后续 == 比较
+        if (isolation != null) {
+            isolation = isolation.strip().toLowerCase(Locale.ROOT);
+            if (isolation.isBlank()) {
+                isolation = null;
+            }
         }
     }
 

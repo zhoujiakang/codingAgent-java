@@ -1,9 +1,11 @@
 package com.agentjava.tool.impl;
 
+import com.agentjava.tool.CwdContext;
 import com.agentjava.tool.Tool;
 import com.agentjava.tool.ToolCategory;
 import com.agentjava.tool.ToolResult;
 
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.List;
@@ -97,6 +99,12 @@ public class BashTool implements Tool {
 
         try {
             ProcessBuilder pb = new ProcessBuilder("bash", "-c", command);
+            // Worktree：把子进程的工作目录显式设成当前 cwd（线程局部），
+            // 不改进程级 cwd——否则并发的子 Agent 之间会互相踩踏。
+            File cwd = CwdContext.dirOrNull();
+            if (cwd != null) {
+                pb.directory(cwd);
+            }
             // 合并 stdout 和 stderr 到同一个流，简化输出解析
             pb.redirectErrorStream(true);
 
