@@ -5,6 +5,8 @@ import com.agentjava.agent.AgentEvent;
 import com.agentjava.config.ProviderConfig;
 import com.agentjava.conversation.ConversationManager;
 import com.agentjava.llm.LlmClient;
+import com.agentjava.mcp.McpManager;
+import com.agentjava.mcp.McpServerConfig;
 import com.agentjava.permission.PermissionMode;
 import com.agentjava.permission.PermissionResponse;
 import com.agentjava.prompt.PlanModePrompt;
@@ -49,8 +51,14 @@ public class AgentModel implements Model {
     private String systemPrompt;
     private final ConversationManager conversation = new ConversationManager();
 
-    /** 工具注册中心：六个内置工具 + 共享的文件状态缓存。 */
+    /** 工具注册中心：六个内置工具 + 共享的文件状态缓存 + 启动期接入的 MCP 工具。 */
     private final ToolRegistry registry = ToolRegistry.createDefault();
+
+    /** MCP 连接管理器；未配置 MCP Server 时为 null。 */
+    private McpManager mcpManager;
+
+    /** 启动期 MCP 接入状态，打印在 banner 之后给用户一个明确反馈。 */
+    private String mcpStatus = "";
 
     private Program program;
     private AppState state;
@@ -93,12 +101,35 @@ public class AgentModel implements Model {
     private boolean bannerPrinted = false;
 
     public AgentModel(List<ProviderConfig> providers, String workingDir) {
+        this(providers, workingDir, List.of());
+    }
+
+    public AgentModel(List<ProviderConfig> providers, String workingDir, List<McpServerConfig> mcpConfigs) {
         this.providers = List.copyOf(providers);
         this.workingDir = workingDir == null ? System.getProperty("user.dir") : workingDir;
         // 先用环境探测（此时 provider 未激活，model 未知）构建一次七模块 System Prompt；
         // 激活 provider 拿到 model 后会用真实 model 重建，让 Environment 段落带上模型名。
         this.systemPrompt = PromptBuilder.buildSystemPrompt(
                 PromptBuilder.detectEnvironment(null), null);
+        // 启动期接入 MCP：连接配置的 Server、发现工具、注册进 ToolRegistry。
+        // 单个 Server 失败只收集错误，不阻断其余 Server，也不阻止启动。
+        if (mcpConfigs != null && !mcpConfigs.isEmpty()) {
+            try {
+                this.mcpManager = new McpManager(mcpConfigs);
+                var result = mcpManager.registerAllTools(registry);
+                if (!result.errors().isEmpty()) {
+                    mcpStatus = Styles.ERROR.render("⚠ MCP 接入异常: " + String.join("; ", result.errors()));
+                } else if (result.serverCount() > 0) {
+                    mcpStatus = Styles.ACCENT.render("✻ 已连接 " + result.serverCount() + " 个 MCP Server，注册 "
+                            + result.tools().size() + " 个工具");
+                }
+                // 退出时统一关闭 MCP 连接，释放子进程与传输资源
+                final McpManager mgr = mcpManager;
+                Runtime.getRuntime().addShutdownHook(new Thread(mgr::shutdown));
+            } catch (Exception e) {
+                mcpStatus = Styles.ERROR.render("⚠ MCP 初始化失败: " + e.getMessage());
+            }
+        }
         // 只有一个 provider 时直接进入对话，多个时才让用户选（F2）
         if (this.providers.size() == 1) {
             this.state = AppState.CHAT;
@@ -127,7 +158,11 @@ public class AgentModel implements Model {
             height = ws.height();
             if (!bannerPrinted) {
                 bannerPrinted = true;
-                return UpdateResult.of(this, Command.println(renderBanner() + "\n" + renderReadyLine()));
+                StringBuilder sb = new StringBuilder(renderBanner()).append("\n").append(renderReadyLine());
+                if (!mcpStatus.isEmpty()) {
+                    sb.append("\n").append(mcpStatus);
+                }
+                return UpdateResult.of(this, Command.println(sb.toString()));
             }
             return UpdateResult.of(this);
         }

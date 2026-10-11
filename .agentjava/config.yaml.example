@@ -31,3 +31,25 @@ providers:
 
 # 只配一个 provider 时，启动直接进入对话；
 # 配了多个，启动后先用方向键选一个（选定后本次会话不再切换）。
+
+# ───────────────────────── MCP Server 配置 ─────────────────────────
+# 把外部 MCP Server 接进 AgentJava，无需改代码即可获得新工具。
+# 支持两种传输：
+#   - stdio：有 command 字段 → 作为本地子进程启动，走 stdin/stdout 管道
+#   - http：有 url 字段 → 发 Streamable HTTP POST（远程 Server）
+# 同名 Server 项目级覆盖用户级（~/.agentjava/config.yaml）。
+# env / headers 里的 ${VAR} 会从当前环境变量展开，避免把密钥明文写进配置。
+mcp_servers:
+  # 本地 stdio 示例（需要 npx 与网络）
+  # github:
+  #   command: "npx"
+  #   args: ["-y", "@modelcontextprotocol/server-github"]
+  #   env:
+  #     GITHUB_TOKEN: "${GITHUB_TOKEN}"
+
+  # 远程 HTTP 示例（需要 Bearer Token）
+  # remote-tool:
+  #   url: "https://api.example.com/mcp"
+  #   headers:
+  #     Authorization: "Bearer ${API_TOKEN}"
+

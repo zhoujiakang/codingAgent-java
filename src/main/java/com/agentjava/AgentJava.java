@@ -4,6 +4,8 @@ import com.agentjava.config.AppConfig;
 import com.agentjava.config.ConfigException;
 import com.agentjava.config.ConfigLoader;
 import com.agentjava.config.ProviderConfig;
+import com.agentjava.mcp.McpManager;
+import com.agentjava.mcp.McpServerConfig;
 import com.agentjava.conversation.ConversationManager;
 import com.agentjava.conversation.ToolResultBlock;
 import com.agentjava.conversation.ToolUseBlock;
@@ -49,9 +51,10 @@ public class AgentJava {
     /** 交互模式：启动 TUI。 */
     private static void runInteractive() {
         AppConfig config = loadConfig();
+        List<McpServerConfig> mcpConfigs = ConfigLoader.loadMcpServers();
         AgentModel model;
         try {
-            model = new AgentModel(config.getProviders(), System.getProperty("user.dir"));
+            model = new AgentModel(config.getProviders(), System.getProperty("user.dir"), mcpConfigs);
         } catch (LlmException e) {
             System.err.println("初始化失败：" + e.getMessage());
             System.exit(1);
@@ -77,6 +80,19 @@ public class AgentJava {
             LlmClient client = LlmClient.create(cfg,
                     PromptBuilder.buildSystemPrompt(PromptBuilder.detectEnvironment(cfg.getModel()), null));
             ToolRegistry registry = ToolRegistry.createDefault();
+            // 非交互模式同样接入 MCP（若有配置）
+            List<McpServerConfig> mcpConfigs = ConfigLoader.loadMcpServers();
+            if (!mcpConfigs.isEmpty()) {
+                var mcpManager = new McpManager(mcpConfigs);
+                var mcpResult = mcpManager.registerAllTools(registry);
+                if (!mcpResult.errors().isEmpty()) {
+                    System.err.println("⚠ MCP 接入异常: " + String.join("; ", mcpResult.errors()));
+                } else if (mcpResult.serverCount() > 0) {
+                    System.out.println("✻ 已连接 " + mcpResult.serverCount() + " 个 MCP Server，注册 "
+                            + mcpResult.tools().size() + " 个工具");
+                }
+                Runtime.getRuntime().addShutdownHook(new Thread(mcpManager::shutdown));
+            }
             List<Map<String, Object>> tools = registry.getAllSchemas(cfg.normalizedProtocol());
             ConversationManager conversation = new ConversationManager();
             conversation.addUserMessage(prompt);

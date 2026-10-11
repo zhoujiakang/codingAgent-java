@@ -1,5 +1,7 @@
 package com.agentjava.config;
 
+import com.agentjava.mcp.McpServerConfig;
+
 import org.yaml.snakeyaml.Yaml;
 
 import java.io.IOException;
@@ -7,6 +9,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -160,5 +163,55 @@ public final class ConfigLoader {
             return b;
         }
         return Boolean.parseBoolean(String.valueOf(value).trim());
+    }
+
+    /**
+     * 载入并合并 MCP Server 配置。
+     *
+     * <p>采用「用户级先入、项目级覆盖」的合并策略：全局 {@code ~/.agentjava/config.yaml} 与项目级
+     * {@code .agentjava/config.yaml} 都可能有 {@code mcp_servers} 段；同名 Server 项目级覆盖用户级，
+     * 和 Git 的 {@code --local} 优先于 {@code --global} 同一思路。两份都不存在时返回空列表（即不接任何 Server）。
+     */
+    public static List<McpServerConfig> loadMcpServers() {
+        Map<String, Map<String, Object>> merged = new LinkedHashMap<>();
+        mergeMcpServers(merged, GLOBAL_PATH);   // 全局先入
+        mergeMcpServers(merged, DEFAULT_PATH);   // 项目覆盖
+        List<McpServerConfig> out = new ArrayList<>();
+        for (var e : merged.entrySet()) {
+            out.add(McpServerConfig.fromYaml(e.getKey(), e.getValue()));
+        }
+        return out;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void mergeMcpServers(Map<String, Map<String, Object>> merged, String path) {
+        Path file = Path.of(path);
+        if (!Files.isRegularFile(file)) {
+            return;
+        }
+        String text;
+        try {
+            text = Files.readString(file, StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            return;
+        }
+        Map<String, Object> raw;
+        try {
+            raw = new Yaml().load(text);
+        } catch (Exception e) {
+            return;
+        }
+        if (raw == null) {
+            return;
+        }
+        Object servers = raw.get("mcp_servers");
+        if (!(servers instanceof Map<?, ?> m)) {
+            return;
+        }
+        for (var entry : ((Map<String, Object>) m).entrySet()) {
+            if (entry.getValue() instanceof Map<?, ?> v) {
+                merged.put(entry.getKey(), (Map<String, Object>) v);
+            }
+        }
     }
 }
