@@ -265,6 +265,52 @@ public class MemoryManager {
         return out;
     }
 
+    /** 只加载用户级记忆（{@code ~/.agentjava/memory}）。分组展示与分别计数都靠它。 */
+    public List<MemoryFile> loadUserMemories() {
+        return MemoryScanner.loadDir(userMemDirPath);
+    }
+
+    /** 只加载项目级记忆（{@code <workDir>/.agentjava/memory}）。 */
+    public List<MemoryFile> loadProjectMemories() {
+        return MemoryScanner.loadDir(projectMemDirPath);
+    }
+
+    /**
+     * 清空双目录：删掉全部 {@code .md}（含两份 MEMORY.md 索引），返回删除条数。
+     *
+     * <p>留着目录不删：目录是在构造时顺手创建的，删了下次还得建；而空目录本身
+     * 没有任何副作用。只认 {@code .md}，避免把别人放进来的临时文件一并扫掉。
+     */
+    public int clearAll() {
+        int removed = 0;
+        for (Path dir : List.of(userMemDirPath, projectMemDirPath)) {
+            removed += deleteMarkdownFiles(dir);
+        }
+        return removed;
+    }
+
+    private static int deleteMarkdownFiles(Path dir) {
+        if (dir == null || !Files.isDirectory(dir)) {
+            return 0;
+        }
+        int removed = 0;
+        try (var entries = Files.list(dir)) {
+            for (Path p : entries.toList()) {
+                if (Files.isRegularFile(p) && p.getFileName().toString().endsWith(".md")) {
+                    try {
+                        Files.deleteIfExists(p);
+                        removed++;
+                    } catch (IOException e) {
+                        // 单个文件删不掉不影响其余文件
+                    }
+                }
+            }
+        } catch (IOException e) {
+            // 目录扫不动就算了（权限、并发删除），返回已删条数
+        }
+        return removed;
+    }
+
     // ───────────────────────── 记忆注入 ─────────────────────────
 
     /**

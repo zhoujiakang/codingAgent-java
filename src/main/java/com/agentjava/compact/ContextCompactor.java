@@ -138,7 +138,7 @@ public final class ContextCompactor {
         boolean ok;
         String summary;
         try {
-            summary = doCompact(conv, client, contextWindow, workDir, sessionId, recovery, toolSchemas);
+            summary = doCompact(conv, client, contextWindow, workDir, sessionId, recovery, toolSchemas, "");
             ok = true;
         } catch (RuntimeException e) {
             ok = false;
@@ -166,7 +166,23 @@ public final class ContextCompactor {
             String sessionId,
             RecoveryState recovery,
             List<Map<String, Object>> toolSchemas) {
-        return doCompact(conv, client, contextWindow, workDir, sessionId, recovery, toolSchemas);
+        return forceCompact(conv, client, contextWindow, workDir, sessionId, recovery, toolSchemas, "");
+    }
+
+    /**
+     * 带重点提示的压缩：{@code focus} 会作为一条硬性要求加进摘要请求，
+     * 服务于 {@code /compact 保留数据库相关内容} 这类用法。空字符串等价于无重点。
+     */
+    public static String forceCompact(
+            ConversationManager conv,
+            LlmClient client,
+            int contextWindow,
+            String workDir,
+            String sessionId,
+            RecoveryState recovery,
+            List<Map<String, Object>> toolSchemas,
+            String focus) {
+        return doCompact(conv, client, contextWindow, workDir, sessionId, recovery, toolSchemas, focus);
     }
 
     // ───────────────────────── 压缩核心 ─────────────────────────
@@ -178,7 +194,8 @@ public final class ContextCompactor {
             String workDir,
             String sessionId,
             RecoveryState recovery,
-            List<Map<String, Object>> toolSchemas) {
+            List<Map<String, Object>> toolSchemas,
+            String focus) {
 
         List<Message> messages = conv.getMessages();
         int keepStart = computeKeepStartIndex(messages);
@@ -188,7 +205,11 @@ public final class ContextCompactor {
         // 只把前缀（messages[0:keepStart]）序列化成文本发给 LLM；工具结果只取前 500 字符。
         // 调用时不传 tools 参数，模型看不到工具定义，自然不会调（且 prompt 明令禁止）。
         String serialized = serializeForSummary(prefix);
-        String prompt = SUMMARY_SYSTEM_PROMPT + "\n\n" + serialized;
+        // 指定了重点就把它提到最前面：摘要模型对「第一段出现的要求」服从度最高，
+        // 放在序列化文本之后容易被长历史淹没。
+        String prompt = SUMMARY_SYSTEM_PROMPT
+                + (focus == null || focus.isBlank() ? "" : "\n\n用户指定了本次压缩的重点：\n" + focus.strip())
+                + "\n\n" + serialized;
 
         ConversationManager summaryConv = new ConversationManager();
         summaryConv.addUserMessage(prompt);

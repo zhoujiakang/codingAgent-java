@@ -2,6 +2,11 @@ package com.agentjava.tui;
 
 import com.agentjava.agent.Agent;
 import com.agentjava.agent.AgentEvent;
+import com.agentjava.command.CommandContext;
+import com.agentjava.command.CommandParser;
+import com.agentjava.command.CommandRegistry;
+import com.agentjava.command.CommandType;
+import com.agentjava.command.UIController;
 import com.agentjava.compact.ContextCompactor;
 import com.agentjava.compact.RecoveryState;
 import com.agentjava.config.ProviderConfig;
@@ -16,7 +21,6 @@ import com.agentjava.permission.PermissionMode;
 import com.agentjava.permission.PermissionResponse;
 import com.agentjava.prompt.PlanModePrompt;
 import com.agentjava.prompt.PromptBuilder;
-import com.agentjava.session.SessionInfo;
 import com.agentjava.session.SessionManager;
 import com.agentjava.session.SessionMessage;
 import com.agentjava.tool.ToolRegistry;
@@ -29,13 +33,11 @@ import com.agentjava.tui.tea.Program;
 import com.agentjava.tui.tea.UpdateResult;
 import com.agentjava.tui.tea.WindowSizeMessage;
 
-import java.time.Instant;
-import java.time.ZoneId;
-import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
 
@@ -48,14 +50,37 @@ import java.util.concurrent.CompletableFuture;
  * 所以这里的 update() 始终是纯粹的状态变换，不碰网络、不碰 IO。
  *
  * 一轮对话的节奏：用户输入 → 进历史 → Agent 循环多轮直到完成 → 事件流实时渲染。
+ *
+ * <p>除主循环外，它还承担两个身份：
+ * <ul>
+ *   <li><b>UI 层</b>：实现 {@link UIController}，把 REPL 的能力打包交给命令系统，
+ *       这样 {@code com.agentjava.command} 里的命令不需要认识任何 TUI 内部类；</li>
+ *   <li><b>命令主机</b>：持有一个 {@link CommandRegistry}，负责「判断输入是不是命令 →
+ *       查命令 → 按类型路由 → 把结果渲染成副作用指令」这条链路。</li>
+ * </ul>
+ *
+ * <p>{@code com.agentjava.tui.tea.Command}（TEA 的副作用指令）与
+ * {@code com.agentjava.command.Command}（Slash Command 定义）同名，后面一律用全限定名区分。
  */
-public class AgentModel implements Model {
+public class AgentModel implements Model, UIController {
 
     public static final String APP_NAME = "AgentJava";
     public static final String VERSION = "0.1.0";
 
-    /** 退出命令。 */
+    /**
+     * 退出命令。真正接客的是 {@link CommandRegistry#createDefault()} 里
+     * 那条 hidden 的 {@code exit} 命令，这里保留常量只是给启动提示文案用。
+     */
     public static final String EXIT_COMMAND = "/exit";
+
+    /**
+     * 手动压缩的 token 下限。低于这个值的上下文不值得跑一次摘要调用——
+     * 压缩本身要用掉一轮 LLM，省下来的 token 还不够付这次请求。
+     */
+    private static final int MIN_COMPACT_TOKENS = 5_000;
+
+    /** Slash Command 注册中心：所有内置命令在这里一次性登记完。 */
+    private final CommandRegistry commands = CommandRegistry.createDefault();
 
     private final List<ProviderConfig> providers;
     private final String workingDir;
@@ -127,14 +152,24 @@ public class AgentModel implements Model {
     /** 输入缓冲：Alt+Enter / Ctrl+J 插入换行，Enter 提交。 */
     private final StringBuilder input = new StringBuilder();
 
+    /**
+     * 命令通过 {@link UIController#addSystemMessage} 攒下来的输出行。
+     * Model 本身不写终端，攒起来交给 {@link Command.Println} 一次性打出去。
+     */
+    private final List<String> pendingSystemMessages = new ArrayList<>();
+
+    /**
+     * 命令通过 {@link UIController#sendUserMessage} 投递的待发文本。
+     * 命令跑完之后如果有值，就把它当作一轮新的用户输入交给 Agent。
+     */
+    private String pendingUserMessage;
+
     /** 流式缓冲：片段实时进这里，本轮结束才落成一条历史消息（由 Agent 负责落地）。 */
     private final StringBuilder streamBuf = new StringBuilder();
     private boolean streaming = false;
     private long requestStartMillis = 0;
     private String spinnerVerb = SpinnerVerbs.random();
 
-    /** 上一轮的统计信息，用于状态栏展示。 */
-    private long lastElapsedMillis = 0;
     private int lastInputTokens = 0;
     private int lastOutputTokens = 0;
     private boolean usageAvailable = false;
@@ -286,6 +321,10 @@ public class AgentModel implements Model {
             case "enter" -> {
                 return submit();
             }
+            // 命令补全：/ 开头才生效，单个候选直接填上，多个候选列出来让用户挑
+            case "tab" -> {
+                return completeCommand();
+            }
             // 多行编辑：Alt+Enter 与 Ctrl+J 都支持，不同终端发的序列不一样
             case "alt+enter", "ctrl+j" -> input.append('\n');
             case "backspace" -> {
@@ -302,65 +341,164 @@ public class AgentModel implements Model {
         return Command.none();
     }
 
-    /** 提交一轮对话，或切换 Plan Mode。 */
+    /**
+     * 提交一行输入。
+     *
+     * <p>分流的时机很关键：必须在消息发出去之前。以 {@code /} 开头的走命令系统，
+     * 在本地执行、不消耗 token、行为确定；否则才进 Agent Loop。
+     */
     private Command submit() {
         String text = input.toString();
         input.setLength(0);
         if (text.isBlank()) {
             return Command.none();
         }
-        String trimmed = text.trim();
-        if (EXIT_COMMAND.equals(trimmed)) {
-            return Command.quit();
+        CommandParser.ParsedInput parsed = CommandParser.parse(text);
+        if (!parsed.isCommand()) {
+            return startAgentTurn(text);
         }
-        // 手动压缩：跳过阈值与熔断器，直接生成结构化摘要重建对话；报告压缩前后估算 token 变化
-        if ("/compact".equals(trimmed)) {
-            if (llmClient == null) {
-                return Command.println(Styles.ERROR.render("✗ 还没有可用的 provider。"));
-            }
-            int before = ContextCompactor.estimateTokens(conversation.getMessages());
-            List<Map<String, Object>> schemas =
-                    registry.getAllSchemas(activeProvider.normalizedProtocol());
-            ContextCompactor.forceCompact(
-                    conversation, llmClient, contextWindow, workingDir, sessionId, recovery, schemas);
-            // 压缩要把 marker 落到会话存档里，否则下次恢复只能全量回放被压缩掉的历史
-            writeCompactBoundary();
-            int after = ContextCompactor.estimateTokens(conversation.getMessages());
-            return Command.println(Styles.ACCENT.render(
-                    "✻ 手动压缩完成: " + before + " → " + after + " estimated tokens"));
-        }
-        // 切换权限模式：/mode default|accept|plan|yolo
-        if (trimmed.startsWith("/mode")) {
-            return handleModeCommand(trimmed.substring(5).trim());
-        }
-        // 切换 Plan Mode：/plan 只读只规划，/do 恢复正常工作模式
-        if ("/plan".equals(trimmed)) {
-            planMode = true;
-            permissionMode = PermissionMode.PLAN;
-            String planPath = PlanModePrompt.getPlanPath(workingDir);
-            conversation.addSystemReminder(
-                    PlanModePrompt.buildReentryReminder(planPath));
-            return Command.println(Styles.ACCENT.render("✻ 已进入 Plan Mode（只读，只规划不改动）"));
-        }
-        if ("/do".equals(trimmed)) {
-            planMode = false;
-            permissionMode = PermissionMode.DEFAULT;
-            String planPath = PlanModePrompt.getPlanPath(workingDir);
-            conversation.addSystemReminder(
-                    PlanModePrompt.buildExitReminder(planPath, PlanModePrompt.planExists(planPath)));
-            return Command.println(Styles.ACCENT.render("✻ 已退出 Plan Mode，恢复正常工作模式"));
-        }
-        // 记忆与会话管理 
-        if ("/memory".equals(trimmed)) {
-            return handleMemoryCommand();
-        }
-        if (trimmed.equals("/session") || trimmed.startsWith("/session ")) {
-            return handleSessionCommand(trimmed.substring("/session".length()).trim());
-        }
-        if (trimmed.equals("/resume") || trimmed.startsWith("/resume ")) {
-            return handleResumeCommand(trimmed.substring("/resume".length()).trim());
-        }
+        return dispatchSlashCommand(parsed);
+    }
 
+    /**
+     * 命令分发：解析 → 查找 → 按类型路由。
+     *
+     * <p>三个分支各有讲究：
+     * <ul>
+     *   <li><b>只输入了 {@code /}</b>：命令名为空。这不是错误，用户只是想看看有哪些命令，
+     *       直接列清单比报错友好；</li>
+     *   <li><b>找不到命令</b>：错误信息里必须带 {@code /help} ——错误提示永远带退出路径，
+     *       这条原则贯穿整个 AgentJava；</li>
+     *   <li><b>缺参数但命令声明了 argPrompt</b>：直接显示那段提示，比「参数缺失」有用得多。</li>
+     * </ul>
+     *
+     * <p>之后按 {@link CommandType} 路由：local / local-ui 的返回值是给人看的文本，
+     * prompt 类型的返回值是一段要发给 LLM 的 prompt。
+     */
+    Command dispatchSlashCommand(CommandParser.ParsedInput parsed) {
+        if (parsed.name().isEmpty()) {
+            return printCommandList();
+        }
+        Optional<com.agentjava.command.Command> found = commands.find(parsed.name());
+        if (found.isEmpty()) {
+            return Command.println(Styles.ERROR.render(
+                    "✗ 未知命令：/" + parsed.name() + "，输入 /help 查看可用命令"));
+        }
+        com.agentjava.command.Command cmd = found.get();
+        if (parsed.args().isEmpty() && !cmd.argPrompt().isBlank()) {
+            return Command.println(Styles.MUTED.render(cmd.argPrompt()));
+        }
+        return switch (cmd.type()) {
+            // 有 handler 的 local-ui 命令（plan/do）同样走这里，差别只在跑完之后刷新一次状态栏
+            case LOCAL, PROMPT, LOCAL_UI -> cmd.hasHandler()
+                    ? runHandlerCommand(cmd, parsed.args())
+                    : runUiCommand(cmd, parsed.args());
+        };
+    }
+
+    /** 有 handler 的命令：拼上下文、执行、按类型处理返回值。 */
+    private Command runHandlerCommand(com.agentjava.command.Command cmd, String args) {
+        String out;
+        try {
+            out = cmd.handler().handle(buildCommandContext(args));
+        } catch (RuntimeException e) {
+            // 命令出错不该把整个 TUI 带崩：兜成一条错误输出，用户可以接着用
+            out = Styles.ERROR.render("✗ 命令执行失败：" + e.getMessage());
+        }
+        if (cmd.type() == CommandType.LOCAL_UI) {
+            refreshStatus();
+        }
+        if (cmd.type() == CommandType.PROMPT) {
+            // prompt 类型的返回值不是展示文本，是要发给 LLM 的提示词
+            Command printed = emitPendingAnd(null);
+            Command turn = startAgentTurn(out);
+            return printed instanceof Command.None ? turn : Command.batch(printed, turn);
+        }
+        return emitThenMaybeRunAgent(out);
+    }
+
+    /**
+     * 没有 handler 的 local-ui 命令兜底实现。
+     *
+     * <p>它们要动的东西（LLM 客户端、会话存档、整个会话状态）只有宿主层才握得住，
+     * 硬塞进 {@link CommandContext} 只会让那个「背包」退化成到处传的 god object。
+     */
+    private Command runUiCommand(com.agentjava.command.Command cmd, String args) {
+        refreshStatus();
+        return switch (cmd.name()) {
+            case "exit" -> Command.quit();
+            case "compact" -> emitThenMaybeRunAgent(compactNow(args));
+            case "clear" -> emitThenMaybeRunAgent(startNewSession());
+            case "mode" -> emitThenMaybeRunAgent(switchPermissionMode(args));
+            case "resume" -> emitThenMaybeRunAgent(resumeSession(args));
+            default -> emitPendingAnd(Styles.MUTED.render("（/" + cmd.name() + " 还没有接进来）"));
+        };
+    }
+
+    /** Tab 补全：输入框以 {@code /} 且不含空格时才生效。 */
+    private Command completeCommand() {
+        String raw = input.toString();
+        // 已经输过参数就不再补全——参数候选（会话 ID 之类）暂未实现
+        if (!raw.startsWith("/") || raw.indexOf(' ') >= 0) {
+            return Command.none();
+        }
+        List<String> candidates = commands.search(raw);
+        if (candidates.isEmpty()) {
+            return Command.none();
+        }
+        if (candidates.size() == 1) {
+            input.setLength(0);
+            input.append(candidates.get(0));
+            return Command.none();
+        }
+        StringBuilder sb = new StringBuilder(Styles.ACCENT.render("候选命令："));
+        for (String candidate : candidates) {
+            sb.append(' ').append(candidate);
+        }
+        return Command.println(sb.toString());
+    }
+
+    /** {@code /} 或 {/help} 的清单输出：清单本身也是从注册中心里查出来的，不硬编码。 */
+    private Command printCommandList() {
+        String text = commands.handlerOf("help")
+                .map(h -> h.handle(buildCommandContext("")))
+                .orElse("（注册中心里没有可用的 /help）");
+        return Command.println(text);
+    }
+
+    /**
+     * 打印命令的输出 + {@link UIController#addSystemMessage} 期间攒下的所有系统消息，
+     * 然后看命令有没有顺手投递一条用户消息（{@code /plan <任务>} 就是这么工作的）。
+     */
+    private Command emitThenMaybeRunAgent(String text) {
+        String follow = pendingUserMessage;
+        pendingUserMessage = null;
+        Command printed = emitPendingAnd(text);
+        if (follow == null || follow.isBlank()) {
+            return printed;
+        }
+        Command turn = startAgentTurn(follow);
+        return printed instanceof Command.None ? turn : Command.batch(printed, turn);
+    }
+
+    /** 把沉淀的系统消息外加一行正文一起打出去。 */
+    private Command emitPendingAnd(String text) {
+        List<String> lines = new ArrayList<>(pendingSystemMessages);
+        pendingSystemMessages.clear();
+        if (text != null && !text.isBlank()) {
+            lines.add(text);
+        }
+        if (lines.isEmpty()) {
+            return Command.none();
+        }
+        return Command.println(String.join("\n", lines));
+    }
+
+    /**
+     * 把一段文本作为用户输入交给 Agent：命令系统转过来的 prompt 与普通输入共用这条路径，
+     * 保证历史落盘、工具链修复、会话存档这几件事对所有来路一视同仁。
+     */
+    private Command startAgentTurn(String text) {
         // 用户输入先写进 scrollback，再进历史：即使请求失败也能看到自己问了什么
         Command echo = Command.println(Styles.PROMPT.render("❯ ") + Styles.USER.render(text));
         conversation.addUserMessage(text);
@@ -395,33 +533,150 @@ public class AgentModel implements Model {
         return echo;
     }
 
-    /** /mode 命令：切换权限模式（default / accept / plan / yolo）。 */
-    private Command handleModeCommand(String arg) {
-        return switch (arg) {
+    /**
+     * 组装命令上下文。
+     *
+     * <p>全部按需包成 Supplier：provider 可能还没激活、工具数量可能因为 MCP 接入而变化，
+     * 用函数式取值保证命令读到的永远是「当下」，而不是建 ctx 那一刻的快照。
+     */
+    private CommandContext buildCommandContext(String args) {
+        return new CommandContext(
+                args == null ? "" : args,
+                this,
+                workingDir,
+                activeProvider == null ? "-" : activeProvider.getModel(),
+                VERSION,
+                sessionId,
+                () -> permissionMode,
+                () -> registry.listTools().size(),
+                () -> contextWindow,
+                memory::loadUserMemories,
+                memory::loadProjectMemories,
+                memory::clearAll,
+                () -> SessionManager.listSessions(workingDir));
+    }
+
+    /** {@code /compact [保留重点]}：低于下限就直接告诉用户不必压缩，别白跑一次 LLM。 */
+    private String compactNow(String focus) {
+        if (llmClient == null) {
+            return Styles.ERROR.render("✗ 还没有可用的 provider。");
+        }
+        int before = ContextCompactor.estimateTokens(conversation.getMessages());
+        if (before < MIN_COMPACT_TOKENS) {
+            return Styles.MUTED.render("✻ 上下文只有 " + before + " tokens，无需压缩（阈值 "
+                    + MIN_COMPACT_TOKENS + "）");
+        }
+        List<Map<String, Object>> schemas =
+                registry.getAllSchemas(activeProvider.normalizedProtocol());
+        try {
+            ContextCompactor.forceCompact(
+                    conversation, llmClient, contextWindow, workingDir, sessionId,
+                    recovery, schemas, focus == null ? "" : focus);
+        } catch (RuntimeException e) {
+            return Styles.ERROR.render("✗ 压缩失败：" + e.getMessage());
+        }
+        // 压缩要把 marker 落到会话存档里，否则下次恢复只能全量回放被压缩掉的历史
+        writeCompactBoundary();
+        int after = ContextCompactor.estimateTokens(conversation.getMessages());
+        return Styles.ACCENT.render("✻ 已压缩: " + before + " → " + after + " estimated tokens");
+    }
+
+    /**
+     * {@code /clear}：旧会话已经增量落盘，这里只要换个新 ID 重开。
+     *
+     * <p>旧的对话不会丢，随时能用 {@code /session list} 找到、用 {@code /resume} 回去。
+     */
+    private String startNewSession() {
+        flushSession();
+        conversation.clear();
+        sessionId = SessionManager.newId();
+        persistedCount = 0;
+        // 重新装配一次记忆索引：清空后对话为空，注入才会发生
+        bootstrapMemory();
+        usageAvailable = false;
+        lastInputTokens = 0;
+        lastOutputTokens = 0;
+        return Styles.ACCENT.render("✻ 已开启新会话 " + sessionId)
+                + Styles.MUTED.render("（旧会话已存档，/session list 查看 · /resume <id> 回去）");
+    }
+
+    /** {@code /mode <模式>}：切换权限模式（default / accept / plan / yolo）。 */
+    private String switchPermissionMode(String arg) {
+        return switch (arg == null ? "" : arg.strip().toLowerCase(Locale.ROOT)) {
             case "default" -> {
-                planMode = false;
+                applyPlanMode(false);
                 permissionMode = PermissionMode.DEFAULT;
-                yield Command.println(Styles.ACCENT.render("✻ 权限模式: default（只读自动放行，写/命令需确认）"));
+                yield Styles.ACCENT.render("✻ 权限模式: default（只读自动放行，写/命令需确认）");
             }
-            case "accept" -> {
-                planMode = false;
+            case "accept", "acceptedits", "accept-edits" -> {
+                applyPlanMode(false);
                 permissionMode = PermissionMode.ACCEPT_EDITS;
-                yield Command.println(Styles.ACCENT.render("✻ 权限模式: acceptEdits（写文件自动放行，命令需确认）"));
+                yield Styles.ACCENT.render("✻ 权限模式: acceptEdits（写文件自动放行，命令需确认）");
             }
             case "plan" -> {
-                planMode = true;
                 permissionMode = PermissionMode.PLAN;
-                conversation.addSystemReminder(
-                        PlanModePrompt.buildReentryReminder(PlanModePrompt.getPlanPath(workingDir)));
-                yield Command.println(Styles.ACCENT.render("✻ 权限模式: plan（同 default，仅规划不改动）"));
+                applyPlanMode(true);
+                yield Styles.ACCENT.render("✻ 权限模式: plan（仅规划不改动）");
             }
-            case "yolo" -> {
-                planMode = false;
+            case "yolo", "bypass" -> {
+                applyPlanMode(false);
                 permissionMode = PermissionMode.BYPASS;
-                yield Command.println(Styles.ERROR.render("⚠ 权限模式: bypass（跳过全部确认，仅黑名单生效，危险！）"));
+                yield Styles.ERROR.render("⚠ 权限模式: bypass（跳过全部确认，仅黑名单生效，危险！）");
             }
-            default -> Command.println(Styles.ERROR.render("用法: /mode default|accept|plan|yolo"));
+            default -> Styles.ERROR.render("用法: /mode default|accept|plan|yolo");
         };
+    }
+
+    /**
+     * Plan Mode 切换：工具可用性（planMode 字段）与 System Prompt 提醒要一起动。
+     *
+     * <p>已经是目标状态时直接返回——提醒注入是给模型看的「上下文断点」，
+     * 重复注入只会让对话里堆一堆同义重复。
+     */
+    private void applyPlanMode(boolean enabled) {
+        if (planMode == enabled) {
+            return;
+        }
+        String planPath = PlanModePrompt.getPlanPath(workingDir);
+        if (enabled) {
+            planMode = true;
+            permissionMode = PermissionMode.PLAN;
+            conversation.addSystemReminder(PlanModePrompt.buildReentryReminder(planPath));
+        } else {
+            planMode = false;
+            permissionMode = PermissionMode.DEFAULT;
+            conversation.addSystemReminder(
+                    PlanModePrompt.buildExitReminder(planPath, PlanModePrompt.planExists(planPath)));
+        }
+    }
+
+    // ───────────────────────── UIController 实现 ─────────────────────────
+
+    @Override
+    public void addSystemMessage(String text) {
+        pendingSystemMessages.add(text);
+    }
+
+    @Override
+    public void sendUserMessage(String text) {
+        pendingUserMessage = text;
+    }
+
+    @Override
+    public void setPlanMode(boolean enabled) {
+        applyPlanMode(enabled);
+    }
+
+    /** 当前上下文估算 token 数。命令要展示的就是界面上展示的同一个数字。 */
+    @Override
+    public int getTokenCount() {
+        return ContextCompactor.estimateTokens(conversation.getMessages());
+    }
+
+    /** Bubble Tea 每帧重绘视图，状态栏自然会更新，所以这里没有要刷的东西。 */
+    @Override
+    public void refreshStatus() {
+        // 契约保留：换成非每帧重绘的 UI 时，这里要真正触发一次重绘
     }
 
     /** 用户在权限确认弹窗下的按键处理：y 允许 / a 始终允许 / n 拒绝。 */
@@ -528,8 +783,6 @@ public class AgentModel implements Model {
         long elapsed = System.currentTimeMillis() - requestStartMillis;
         streaming = false;
         streamBuf.setLength(0);
-
-        lastElapsedMillis = elapsed;
 
         if (fullText.isBlank()) {
             return Command.println(Styles.MUTED.render("（本轮没有返回文本内容）"));
@@ -648,73 +901,30 @@ public class AgentModel implements Model {
         }
     }
 
-    // ───────────────────────── UI 命令 ─────────────────────────
+    // ───────────────────────── /resume：会话切换 ─────────────────────────
 
-    /** {@code /memory}：列出双目录的自动记忆。 */
-    private Command handleMemoryCommand() {
-        var all = memory.loadAll();
-        if (all.isEmpty()) {
-            return Command.println(Styles.MUTED.render(
-                    "（还没有任何自动记忆。和用户聊上几句后，Agent 会自动提取值得记住的信息）"));
-        }
-        var lines = new ArrayList<String>();
-        lines.add(Styles.ACCENT.render("Memories (" + all.size() + " entries)"));
-        for (var f : all) {
-            String type = f.type().isBlank() ? "unknown" : f.type();
-            String name = f.name().isBlank() ? f.filename() : f.name();
-            String desc = f.description().isBlank() ? f.filename() : f.description();
-            lines.add("  " + Styles.USER.render("[" + type + "] " + name)
-                    + Styles.MUTED.render(" — " + desc));
-        }
-        lines.add(Styles.MUTED.render("  项目记忆: " + memory.projectMemDir()));
-        lines.add(Styles.MUTED.render("  用户记忆: " + memory.userMemDir()));
-        return Command.println(String.join("\n", lines));
-    }
-
-    /** {@code /session}：列出会话（当前会话打星号）；{@code /session clean} 清理过期存档。 */
-    private Command handleSessionCommand(String arg) {
-        if ("clean".equals(arg)) {
-            int removed = SessionManager.cleanExpiredSessions(workingDir);
-            return Command.println(Styles.ACCENT.render("✻ 已清理过期会话: " + removed + " 个（阈值 "
-                    + SessionManager.EXPIRY_DAYS + " 天）"));
-        }
-        var sessions = SessionManager.listSessions(workingDir);
-        if (sessions.isEmpty()) {
-            return Command.println(Styles.MUTED.render("（还没有历史会话）"));
-        }
-        var lines = new ArrayList<String>();
-        lines.add(Styles.ACCENT.render("Sessions (" + sessions.size() + ")"));
-        for (SessionInfo s : sessions) {
-            String mark = s.id().equals(sessionId)
-                    ? Styles.PROMPT.render("* ") : "  ";
-            String branch = s.gitBranch().isBlank() ? "" : " · " + s.gitBranch();
-            lines.add(mark + Styles.USER.render(s.id()) + Styles.MUTED.render(
-                    "  " + formatInstant(s.modTime()) + " · " + s.messageCount() + " 条"
-                            + " · " + formatBytes(s.fileSize()) + branch));
-            String title = s.firstMessage().isBlank() ? "(no title)" : s.firstMessage();
-            lines.add("     " + Styles.MUTED.render(title));
-        }
-        lines.add(Styles.MUTED.render("  * 当前会话 · 用 /resume <id> 回到指定会话"));
-        return Command.println(String.join("\n", lines));
-    }
-
-    /** {@code /resume [id]}：恢复历史会话；不带参数时列出可选会话。 */
-    private Command handleResumeCommand(String arg) {
+    /**
+     * {@code /resume <id>}：回到历史会话。
+     *
+     * <p>入口检查放在这里而不是注册中心：能不能恢复取决于「当前是否正在流式输出」，
+     * 这类 UI 状态只有宿主知道。
+     */
+    private String resumeSession(String id) {
         if (streaming) {
-            return Command.println(Styles.ERROR.render("✗ 正在回复中，请等本轮结束再切换会话"));
+            return Styles.ERROR.render("✗ 正在回复中，请等本轮结束再切换会话");
+        }
+        if (id == null || id.isBlank()) {
+            return Styles.ERROR.render("✗ 请带上会话 ID。历史会话列表见 /session list");
         }
         var sessions = SessionManager.listSessions(workingDir);
         if (sessions.isEmpty()) {
-            return Command.println(Styles.MUTED.render("（还没有历史会话）"));
+            return Styles.MUTED.render("（还没有历史会话）");
         }
-        if (arg.isBlank()) {
-            return handleSessionCommand("");
-        }
-        boolean exists = sessions.stream().anyMatch(s -> s.id().equals(arg));
+        boolean exists = sessions.stream().anyMatch(s -> s.id().equals(id));
         if (!exists) {
-            return Command.println(Styles.ERROR.render("✗ 找不到会话: " + arg));
+            return Styles.ERROR.render("✗ 找不到会话: " + id);
         }
-        return restoreSession(arg);
+        return restoreSession(id);
     }
 
     /**
@@ -730,10 +940,10 @@ public class AgentModel implements Model {
      * <p>恢复后 {@code sessionId} 切到目标会话，后续对话继续往同一个 JSONL 追加，
      * 工具结果溢写目录也随之切换，这样回读时还能读到当时的溢写文件。
      */
-    private Command restoreSession(String id) {
+    private String restoreSession(String id) {
         List<SessionMessage> records = SessionManager.loadSession(workingDir, id);
         if (records.isEmpty()) {
-            return Command.println(Styles.ERROR.render("✗ 会话为空或全部记录损坏: " + id));
+            return Styles.ERROR.render("✗ 会话为空或全部记录损坏: " + id);
         }
         long lastTs = 0;
         for (SessionMessage m : records) {
@@ -781,25 +991,7 @@ public class AgentModel implements Model {
             lines.add(Styles.MUTED.render("  历史超过阈值已压缩: " + before + " → " + after
                     + " estimated tokens"));
         }
-        return Command.println(String.join("\n", lines));
-    }
-
-    private static String formatInstant(Instant instant) {
-        if (instant == null || Instant.EPOCH.equals(instant)) {
-            return "-";
-        }
-        return DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")
-                .withZone(ZoneId.systemDefault()).format(instant);
-    }
-
-    private static String formatBytes(long bytes) {
-        if (bytes < 1024) {
-            return bytes + "B";
-        }
-        if (bytes < 1024 * 1024) {
-            return "%.1fKB".formatted(Locale.ROOT, bytes / 1024.0);
-        }
-        return "%.1fMB".formatted(Locale.ROOT, bytes / (1024.0 * 1024.0));
+        return String.join("\n", lines);
     }
 
     // ───────────────────────── 渲染 ─────────────────────────
@@ -871,27 +1063,56 @@ public class AgentModel implements Model {
         return out;
     }
 
-    /** 状态栏：左侧 provider 名，右侧模型名 + token 用量 + 本轮耗时；Plan Mode 时标 PLAN。 */
+    /**
+     * 状态栏：模式 + token 用量 + 一条随模式变化的命令提示。
+     *
+     * <pre>
+     * AgentJava [DEFAULT]  tokens: 45,230/200k · deepseek-chat · /help 查看命令
+     * AgentJava [PLAN]     tokens: 12,300/200k · deepseek-chat · /plan 退出 Plan 模式
+     * </pre>
+     *
+     * <p>提示语跟着模式走是有意为之：用户最容易困惑的不是「有什么命令」，
+     * 而是「我现在处在什么状态、怎么出去」。宽度不够时依次丢弃模型名、token 用量，
+     * 保证模式标记与提示始终可见。
+     */
     private String renderStatusBar() {
-        String left = activeProvider == null ? "-" : activeProvider.getName();
-        if (planMode) {
-            left += Styles.ACCENT.render(" · PLAN");
-        }
-        // 权限模式：default 不额外标注；accept/yolo 显式标出（plan 已由上方 PLAN 标出）
-        if (permissionMode == PermissionMode.ACCEPT_EDITS) {
-            left += Styles.ACCENT.render(" · ACCEPT");
-        } else if (permissionMode == PermissionMode.BYPASS) {
-            left += Styles.ERROR.render(" · BYPASS");
-        }
-        String right = activeProvider == null ? "-" : activeProvider.getModel();
+        String mode = planMode ? "PLAN" : switch (permissionMode) {
+            case DEFAULT -> "DEFAULT";
+            case ACCEPT_EDITS -> "ACCEPT";
+            case BYPASS -> "BYPASS";
+            case PLAN -> "PLAN";
+        };
+        String left = (activeProvider == null ? "-" : activeProvider.getName())
+                + Styles.ACCENT.render(" [" + mode + "]");
+        String tokens = "tokens: " + thousands(getTokenCount()) + "/" + shortNumber(contextWindow);
+        String model = activeProvider == null ? "-" : activeProvider.getModel();
+        String hint = planMode ? "/plan 退出 Plan 模式" : "/help 查看命令";
+        int visible = width > 0 ? width : 80;
+
+        // 从左到右依次丢弃：token 用量先让位，最后是模式标记与提示语
+        List<String> parts = new ArrayList<>();
+        parts.add(tokens);
         if (usageAvailable) {
-            right += " · ↑" + lastInputTokens + " ↓" + lastOutputTokens;
+            parts.add("↑" + lastInputTokens + " ↓" + lastOutputTokens);
         }
-        if (lastElapsedMillis > 0) {
-            right += " · " + formatSeconds(lastElapsedMillis);
+        parts.add(model);
+        parts.add(hint);
+        while (parts.size() > 1
+                && Ansi.displayWidth(left) + 1 + Ansi.displayWidth(String.join(" · ", parts)) > visible) {
+            parts.remove(0);
         }
-        int gap = Math.max(1, width - Ansi.displayWidth(left) - Ansi.displayWidth(right));
+        String right = String.join(" · ", parts);
+        int gap = Math.max(1, visible - Ansi.displayWidth(left) - Ansi.displayWidth(right));
         return left + " ".repeat(gap) + right;
+    }
+
+    private static String thousands(int n) {
+        return String.format(Locale.ROOT, "%,d", n);
+    }
+
+    /** token 总量的紧凑写法：200000 → 200k。 */
+    private static String shortNumber(int n) {
+        return n >= 1_000 ? (n / 1_000) + "k" : String.valueOf(n);
     }
 
     private String renderBanner() {
@@ -916,11 +1137,11 @@ public class AgentModel implements Model {
         return sb.toString().stripTrailing();
     }
 
-    /** 启动后的一行就绪提示。 */
+    /** 启动后的一行就绪提示：只指个方向，完整的命令清单在 /help 里。 */
     private String renderReadyLine() {
         return Styles.ACCENT.render("✻ 已就绪")
-                + Styles.MUTED.render(" · " + EXIT_COMMAND + " 退出 · /memory 记忆 · /session 会话 · /resume 回溯")
-                + Styles.MUTED.render("\n  /mode 权限模式 · /plan 计划模式 · /compact 压缩上下文");
+                + Styles.MUTED.render(" · " + EXIT_COMMAND + " 退出 · Tab 补全命令")
+                + Styles.MUTED.render("\n  /help 看全部命令 · /status 看当前状态 · /plan 计划模式 · /review 审查变更");
     }
 
     private String separator() {
