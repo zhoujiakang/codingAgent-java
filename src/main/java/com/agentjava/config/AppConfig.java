@@ -12,6 +12,13 @@ public class AppConfig {
 
     private List<ProviderConfig> providers = new ArrayList<>();
 
+    /**
+     * 是否启用 coordinator 模式。开启后 Lead 的工具集收窄到纯调度
+     * （Agent / SendMessage / TaskStop / SyntheticOutput / TeamDelete），
+     * 并每轮注入调度指引。只在配置里定，会话中途不切换。
+     */
+    private boolean enableCoordinatorMode = false;
+
     public AppConfig() {
     }
 
@@ -25,5 +32,13 @@ public class AppConfig {
 
     public void setProviders(List<ProviderConfig> providers) {
         this.providers = providers;
+    }
+
+    public boolean isEnableCoordinatorMode() {
+        return enableCoordinatorMode;
+    }
+
+    public void setEnableCoordinatorMode(boolean enableCoordinatorMode) {
+        this.enableCoordinatorMode = enableCoordinatorMode;
     }
 }

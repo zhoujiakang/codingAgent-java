@@ -57,12 +57,33 @@ public final class ToolFilter {
     public static final Set<String> ASYNC_AGENT_ALLOWED_TOOLS = Set.of(
             "ReadFile", "WriteFile", "EditFile", "Bash", "Glob", "Grep", "LoadSkill");
 
+    /**
+     * teammate 在协作工具之外额外被挡掉的工具。组建和解散团队由 Lead 负责，
+     * teammate 只管干活和相互协调，不参与团队成员管理。
+     */
+    public static final Set<String> TEAMMATE_DISALLOWED_TOOLS = Set.of("TeamCreate", "TeamDelete");
+
     private ToolFilter() {
     }
 
     /** 最常见的同步内置 Agent 场景：非后台、非自定义。 */
     public static ToolRegistry filterForAgent(ToolRegistry source, AgentDefinition def) {
         return filterForAgent(source, def, false);
+    }
+
+    /**
+     * teammate 专用过滤：在常规子 Agent 规则之上，再挡掉团队成员管理工具。
+     *
+     * <p>{@code Agent} 由 {@link #ALL_AGENT_DISALLOWED_TOOLS} 在更前面一层挡掉，
+     * 所以 teammate 不会再往下派子 Agent。
+     */
+    public static ToolRegistry filterForTeammate(ToolRegistry source, AgentDefinition def) {
+        ToolRegistry filtered = new ToolRegistry();
+        for (Tool tool : filterForAgent(source, def).listTools()) {
+            if (TEAMMATE_DISALLOWED_TOOLS.contains(tool.name())) continue;
+            filtered.register(tool);
+        }
+        return filtered;
     }
 
     /**

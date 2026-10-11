@@ -13,6 +13,7 @@ import com.agentjava.llm.LlmClient;
 import com.agentjava.llm.StreamEvent;
 import com.agentjava.permission.PermissionChecker;
 import com.agentjava.permission.PermissionMode;
+import com.agentjava.prompt.CoordinatorPrompt;
 import com.agentjava.prompt.PlanModePrompt;
 import com.agentjava.tool.Tool;
 import com.agentjava.tool.ToolCategory;
@@ -27,6 +28,9 @@ import java.util.Set;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BooleanSupplier;
+import java.util.function.Predicate;
+import java.util.function.Supplier;
 
 /**
  * Agent：持有 LLM 客户端、工具注册中心和配置，驱动核心的 ReAct 主循环。
@@ -81,6 +85,22 @@ public class Agent {
      * 在主循环里，工具级那几个在 {@link StreamingExecutor} 里。为 null 时全部退化成空操作。
      */
     private HookEngine hookEngine;
+
+    /**
+     * 每轮迭代拉取的通知：排空团队邮箱里 Lead 的未读消息、后台子 Agent 的完成通知。
+     * 这些通知格式化成 system-reminder 注入对话，Lead 才能在下一轮看到 teammate 的汇报。
+     * 为 null 时跳过（没有团队/子 Agent 的场景）。
+     */
+    private Supplier<List<String>> notificationFn;
+
+    /**
+     * 工具名过滤器：给定工具名返回是否保留。Coordinator 模式据此把 Lead 的工具集
+     * 收窄到纯调度。为 null 时保留全部工具。
+     */
+    private Predicate<String> toolNameFilter;
+
+    /** coordinator 模式是否生效，决定那份调度指引发不发。为 null 时视为不生效。 */
+    private BooleanSupplier coordinatorActiveFn;
 
     public Agent(LlmClient client, ToolRegistry registry, String protocol, String baseSystemPrompt) {
         this.client = client;
@@ -153,6 +173,42 @@ public class Agent {
         this.hookEngine = hookEngine;
     }
 
+    /** 获取权限检查器。teammate 主循环靠它判断是否处在计划模式（PLAN）。 */
+    public PermissionChecker getChecker() {
+        return checker;
+    }
+
+    /**
+     * 直接设置权限检查器。spawn teammate 时用它把「按 plan_mode_required 建的
+     * 只读检查器」装上去，绕过 {@link #setWorkDir} 里按 permissionMode 重建的逻辑。
+     */
+    public void setChecker(PermissionChecker checker) {
+        this.checker = checker;
+        if (checker != null) {
+            this.permissionMode = checker.getMode();
+        }
+    }
+
+    /** 获取当前工作目录（teammate 读计划文件、建 worktree 时要用）。 */
+    public String getWorkDir() {
+        return workDir;
+    }
+
+    /** 注入每轮拉取通知的函数（团队邮箱 + 后台子 Agent 完成通知）。 */
+    public void setNotificationFn(Supplier<List<String>> notificationFn) {
+        this.notificationFn = notificationFn;
+    }
+
+    /** 注入工具名过滤器；返回 false 的工具不进 schema，模型自然调不到。 */
+    public void setToolNameFilter(Predicate<String> toolNameFilter) {
+        this.toolNameFilter = toolNameFilter;
+    }
+
+    /** 注入 coordinator 模式判定；为 true 时每轮注入调度指引。 */
+    public void setCoordinatorActiveFn(BooleanSupplier coordinatorActiveFn) {
+        this.coordinatorActiveFn = coordinatorActiveFn;
+    }
+
     /**
      * 启动 Agent Loop，立即返回一个事件队列。循环跑在后台虚拟线程里，
      * 调用方拿到队列后逐个取事件即可（最后一个事件一定是 LoopComplete 或 ErrorEvent）。
@@ -188,13 +244,31 @@ public class Agent {
                     break;
                 }
 
-                // Plan Mode：工具只暴露只读类（硬约束），且通过 system-reminder 按轮次
-                // 注入提醒（软约束）。System Prompt 本身保持不变，以便 Prompt Cache 持续命中。
+                // 每轮开头：把 teammate / 后台子 Agent 的汇报拉进来，格式化成 system-reminder。
+                // 拉模式而非推模式：往对话里写只有 Agent 这一层握得住，后台线程直接改会跟主循环抢。
+                if (notificationFn != null) {
+                    List<String> notes = notificationFn.get();
+                    if (notes != null && !notes.isEmpty()) {
+                        conv.addSystemReminder(String.join("\n\n", notes));
+                    }
+                }
+
+                // Coordinator 模式：工具集收窄到纯调度（硬约束），并按轮次注入调度指引（软约束）。
+                // 判定和工具过滤必须同一套条件，否则会出现工具收窄了但指引没发的状态。
+                boolean coordinator = coordinatorActiveFn != null && coordinatorActiveFn.getAsBoolean();
+                if (coordinator) {
+                    conv.addSystemReminder(CoordinatorPrompt.buildReminder(iteration));
+                }
+
                 List<Tool> tools = planMode
                         ? registry.listTools().stream()
                         .filter(t -> t.category() == ToolCategory.READ)
                         .toList()
                         : registry.listTools();
+                // 工具名过滤：coordinator 模式下只留白名单里的调度工具
+                if (toolNameFilter != null) {
+                    tools = tools.stream().filter(t -> toolNameFilter.test(t.name())).toList();
+                }
                 var schemas = registry.schemasOf(tools, protocol);
                 client.setSystemPrompt(baseSystemPrompt);
 

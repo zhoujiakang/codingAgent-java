@@ -35,6 +35,13 @@ import com.agentjava.subagent.AgentLoader;
 import com.agentjava.subagent.AgentTool;
 import com.agentjava.subagent.SubAgentTaskManager;
 import com.agentjava.subagent.TraceRegistry;
+import com.agentjava.teams.Coordinator;
+import com.agentjava.teams.TaskStopTool;
+import com.agentjava.teams.TeamManager;
+import com.agentjava.teams.TeamTaskTools;
+import com.agentjava.teams.TeamTools;
+import com.agentjava.teams.TeammateRunner;
+import com.agentjava.tool.SyntheticOutputTool;
 import com.agentjava.worktree.WorktreeManager;
 import com.agentjava.worktree.WorktreeSession;
 import com.agentjava.worktree.WorktreeSessionStore;
@@ -241,6 +248,27 @@ public class AgentModel implements Model, UIController {
     /** 启动期的一行状态：有几个子 Agent 可用。 */
     private String agentStatus = "";
 
+    // ─────────────────── Agent Teams 多 Agent 协作 ───────────────────
+
+    /**
+     * 团队管理器：持有所有活跃团队（持久成员、文件邮箱、共享任务板）。
+     *
+     * <p>它同时被两处使用：{@link AgentTool} 拿到它才能在 {@code Agent(team_name=...)}
+     * 时把子 Agent 派成长期 teammate；TUI 这一层用它注册团队协作工具
+     * （SendMessage / TeamCreate / TeamDelete / TaskStop），并在每轮迭代前
+     * 排空 Lead 邮箱把队友消息注入对话。
+     */
+    private TeamManager teamManager;
+
+    /**
+     * 是否启用 Coordinator 模式。
+     *
+     * <p>开启后主 Agent 被收紧为「协调者」：只能通过 Agent / SendMessage / TaskStop /
+     * SyntheticOutput / TeamDelete 这五个工具发号施令，不再自己直接读写文件或跑命令。
+     * 由 {@code enable_coordinator_mode} 配置项控制，默认关闭。
+     */
+    private boolean coordinatorEnabled = false;
+
     /** 自动压缩熔断器，跨轮次累积。 */
     private final ContextCompactor.AutoCompactTrackingState breaker =
             new ContextCompactor.AutoCompactTrackingState();
@@ -293,10 +321,16 @@ public class AgentModel implements Model, UIController {
     private boolean bannerPrinted = false;
 
     public AgentModel(List<ProviderConfig> providers, String workingDir) {
-        this(providers, workingDir, List.of());
+        this(providers, workingDir, List.of(), false);
     }
 
     public AgentModel(List<ProviderConfig> providers, String workingDir, List<McpServerConfig> mcpConfigs) {
+        this(providers, workingDir, mcpConfigs, false);
+    }
+
+    public AgentModel(List<ProviderConfig> providers, String workingDir,
+                      List<McpServerConfig> mcpConfigs, boolean coordinatorEnabled) {
+        this.coordinatorEnabled = coordinatorEnabled;
         this.providers = List.copyOf(providers);
         this.workingDir = workingDir == null ? System.getProperty("user.dir") : workingDir;
         // 跨会话记忆：构造即确保双目录存在（用户级 ~/.agentjava/memory 与项目级 .agentjava/memory）
@@ -615,6 +649,18 @@ public class AgentModel implements Model, UIController {
         agentTool.setWorktreeManager(worktreeManager);
         // 启动时尝试从会话文件恢复已进入的 Worktree（--resume 支持）
         tryRestoreWorktreeSession();
+
+        // ── Agent Teams ──
+        // 团队管理器先建、再回灌给 AgentTool：这样 Agent 工具带 team_name 时
+        // 才能把子 Agent 派成长期 teammate。随后把协作工具注册进主注册表，
+        // 让主 Agent 能建队、发消息、停队友、输出结构化结果。
+        teamManager = new TeamManager();
+        agentTool.setTeamManager(teamManager);
+        registry.register(new TeamTools.TeamCreateTool(teamManager));
+        registry.register(new TeamTools.TeamDeleteTool(teamManager));
+        registry.register(new TaskStopTool(teamManager));
+        registry.register(new SyntheticOutputTool());
+        registry.register(new TeamTools.SendMessageTool(teamManager, TeammateRunner.LEAD_NAME));
 
         // /worktree 命令：list / create / enter / exit / remove 五个子命令
         commands.register(new com.agentjava.command.Command(
@@ -1372,6 +1418,12 @@ public class AgentModel implements Model, UIController {
         agent.setRecovery(recovery);
         agent.setBreaker(breaker);
         agent.setHookEngine(hookEngine);
+        // 每轮迭代前拉取：队友消息（团队邮箱）+ 后台子任务完成通知，折叠成一段 system-reminder
+        agent.setNotificationFn(this::collectNotifications);
+        // Coordinator 模式：把主 Agent 的工具表收紧到协调类工具；协调者身份同步给 Agent，
+        // 由它在每轮注入协调指引
+        agent.setToolNameFilter(name -> !coordinatorEnabled || Coordinator.isCoordinatorTool(name));
+        agent.setCoordinatorActiveFn(() -> Coordinator.isActive(coordinatorEnabled));
         // 子 Agent 每轮都要重新对齐这几样：会话 ID 会随 /clear 变，权限模式会随 /mode 变，
         // Hook 引擎在引擎装配完成前是 null
         if (agentTool != null) {
@@ -1383,6 +1435,26 @@ public class AgentModel implements Model, UIController {
         BlockingQueue<AgentEvent> queue = agent.run(conversation);
         Thread.startVirtualThread(() -> pumpAgentEvents(queue));
         return echo;
+    }
+
+    /**
+     * 收集本轮迭代前要注入对话的通知：队友消息 + 后台子任务完成。
+     *
+     * <p>两条来源都走 {@code agent.setNotificationFn} 的同一个入口——协作消息与任务通知
+     * 都是「异步发生的、要求主 Agent 在下一轮看到」的信息，合在一起注入省一段前缀。
+     */
+    private List<String> collectNotifications() {
+        var notes = new ArrayList<String>();
+        // 队友发来的消息：排空 Lead 在全部团队里的邮箱
+        notes.addAll(TeammateRunner.drainLeadMailbox(teamManager));
+        // 后台子 Agent 任务通知：转成结构化的 task-notification 标签
+        if (taskManager != null) {
+            for (var n : taskManager.drainNotifications()) {
+                notes.add("<task-notification>Task %s: %s (%s)</task-notification>"
+                        .formatted(n.taskId(), n.name(), n.status()));
+            }
+        }
+        return notes;
     }
 
     /**

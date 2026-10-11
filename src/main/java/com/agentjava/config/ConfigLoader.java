@@ -104,6 +104,8 @@ public final class ConfigLoader {
 
         AppConfig config = new AppConfig();
         config.setProviders(providers);
+        // coordinator 模式开关，缺省关闭
+        config.setEnableCoordinatorMode(bool(raw.get("enable_coordinator_mode")));
         return config;
     }
 

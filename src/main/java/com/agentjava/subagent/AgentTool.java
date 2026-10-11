@@ -5,7 +5,14 @@ import com.agentjava.conversation.ConversationManager;
 import com.agentjava.conversation.Message;
 import com.agentjava.hook.HookEngine;
 import com.agentjava.llm.LlmClient;
+import com.agentjava.permission.PermissionChecker;
 import com.agentjava.permission.PermissionMode;
+import com.agentjava.teams.AgentNameRegistry;
+import com.agentjava.teams.SpawnDispatcher;
+import com.agentjava.teams.TeamManager;
+import com.agentjava.teams.TeamTaskTools;
+import com.agentjava.teams.TeamTools;
+import com.agentjava.teams.TeammateRunner;
 import com.agentjava.worktree.AgentWorktree;
 import com.agentjava.worktree.WorktreeManager;
 import com.agentjava.tool.Tool;
@@ -13,6 +20,7 @@ import com.agentjava.tool.ToolCategory;
 import com.agentjava.tool.ToolRegistry;
 import com.agentjava.tool.ToolResult;
 
+import java.nio.file.Path;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -96,6 +104,12 @@ public class AgentTool implements Tool {
     /** Worktree 管理器：isolation=worktree 时用于创建/清理隔离副本。 */
     private WorktreeManager worktreeManager;
 
+    /**
+     * 团队管理器：传了 team_name 时把子 Agent 作为长期 teammate 派出去。
+     * 为 null 时 team_name 参数无效，仍按一次性子 Agent 处理。
+     */
+    private TeamManager teamManager;
+
     /** 本工具实例的生成上下文；Fork 子 Agent 里的实例被标成 {@link #FORK_QUERY_SOURCE}。 */
     private volatile String querySource = "";
 
@@ -177,6 +191,15 @@ public class AgentTool implements Tool {
         this.worktreeManager = worktreeManager;
     }
 
+    /** 注入团队管理器，启用 team_name 参数（长期 teammate 模式）。 */
+    public void setTeamManager(TeamManager teamManager) {
+        this.teamManager = teamManager;
+    }
+
+    public TeamManager getTeamManager() {
+        return teamManager;
+    }
+
     public SubAgentTaskManager getTaskManager() {
         return taskManager;
     }
@@ -230,6 +253,8 @@ public class AgentTool implements Tool {
         clone.trace = this.trace;
         clone.parentConversation = this.parentConversation;
         clone.parentSpanId = this.parentSpanId;
+        clone.worktreeManager = this.worktreeManager;
+        clone.teamManager = this.teamManager;
         clone.querySource = qs;
         return clone;
     }
@@ -303,6 +328,19 @@ public class AgentTool implements Tool {
                 "type", "string",
                 "enum", List.of("worktree"),
                 "description", "文件系统隔离模式：worktree 把子 Agent 放进独立的 Git 工作树中运行"));
+        properties.put("team_name", Map.of(
+                "type", "string",
+                "description", "REQUIRED when creating team members. Spawns the agent as a long-running "
+                        + "teammate under this team (created via TeamCreate). Unlike regular sub-agents, team "
+                        + "members run in their own terminal, persist after the lead returns, and communicate "
+                        + "with each other via SendMessage. Without team_name the agent runs as a one-shot "
+                        + "sub-agent that blocks and returns inline."));
+        properties.put("plan_mode_required", Map.of(
+                "type", "boolean",
+                "description", "Only meaningful together with team_name. When true, the teammate starts in plan "
+                        + "mode: it can read and investigate but cannot modify anything until it submits a plan "
+                        + "and you approve it via SendMessage with type='plan_approval_response'. Use it for "
+                        + "risky or ambiguous tasks where a wrong direction would cost a lot of rework."));
 
         Map<String, Object> inputSchema = new LinkedHashMap<>();
         inputSchema.put("type", "object");
@@ -329,6 +367,21 @@ public class AgentTool implements Tool {
         String subagentType = str(safeArgs, "subagent_type");
         String modelOverride = str(safeArgs, "model");
         String agentName = str(safeArgs, "name");
+        String teamName = str(safeArgs, "team_name");
+        boolean planModeRequired = Boolean.TRUE.equals(safeArgs.get("plan_mode_required"));
+
+        // 团队路径：先于 Fork / 子 Agent 判断，team_name 才不会因为走了别的分支而被跳过
+        if (teamName != null && !teamName.isBlank() && teamManager != null) {
+            AgentDefinition def = (subagentType != null && !subagentType.isBlank())
+                    ? resolveSpec(subagentType) : resolveSpec(AgentDefinition.GENERAL_PURPOSE.agentType());
+            if (def == null) {
+                def = resolveSpec(AgentDefinition.GENERAL_PURPOSE.agentType());
+            }
+            String memberName = (agentName != null && !agentName.isBlank()) ? agentName : description;
+            String isolation = str(safeArgs, "isolation");
+            return runAsTeammate(def, teamName, memberName, description, prompt,
+                    modelOverride, isolation, planModeRequired);
+        }
 
         String isolation = str(safeArgs, "isolation");
         if ("worktree".equalsIgnoreCase(isolation)) {
@@ -492,6 +545,101 @@ public class AgentTool implements Tool {
             return new ToolResult(r.output() + cleanup[0], r.isError());
         }
         return r;
+    }
+
+    // ───────────────────────── 团队路径 ─────────────────────────
+
+    /**
+     * 把子 Agent 作为长期 teammate 派出去。
+     *
+     * <p>与一次性子 Agent 的区别：teammate 常驻、有独立对话与收件箱，teammate 之间可经
+     * SendMessage 点对点通信。spawn 的实际落点（虚拟线程 / tmux / iTerm）由团队后端决定。
+     */
+    private ToolResult runAsTeammate(AgentDefinition def, String teamName, String agentName,
+                                     String description, String prompt, String modelOverride,
+                                     String isolation, boolean planModeRequired) {
+        if (client == null) {
+            return ToolResult.error("Error: 还没有可用的 provider，无法派发 teammate");
+        }
+
+        // 团队不存在就顺手建一个：coordinator 模式下 TeamCreate 不在白名单里，
+        // 要求 Lead 先建团队再派人，它会卡在第一步。
+        TeamManager.Team team = teamManager.getTeam(teamName);
+        if (team == null) {
+            team = teamManager.createTeam(teamName, TeamManager.detectBackend(),
+                    TeammateRunner.LEAD_NAME, description);
+        }
+
+        // teammate 名去重：小写、截断到 30 字符，重名加数字后缀
+        String memberName = agentName.replaceAll("\\s+", "-").toLowerCase(Locale.ROOT);
+        if (memberName.length() > 30) memberName = memberName.substring(0, 30);
+        String base = memberName;
+        int suffix = 2;
+        while (team.hasMember(memberName)) {
+            memberName = base + "-" + suffix++;
+        }
+
+        ToolRegistry subRegistry = ToolFilter.filterForTeammate(parentRegistry, def);
+        // 给 teammate 注入协调工具：按自己的名字发消息，以及读写团队共享任务板
+        subRegistry.register(new TeamTools.SendMessageTool(teamManager, memberName));
+        subRegistry.register(new TeamTaskTools.TaskCreateTool(teamManager, teamName, memberName));
+        subRegistry.register(new TeamTaskTools.TaskGetTool(teamManager, teamName));
+        subRegistry.register(new TeamTaskTools.TaskListTool(teamManager, teamName));
+        subRegistry.register(new TeamTaskTools.TaskUpdateTool(teamManager, teamName));
+
+        LlmClient subClient = selectClient(def.model(), modelOverride);
+
+        // 收集其他队友名字供附录使用
+        List<String> otherMembers = team.memberNames();
+        String addendum = TeammateRunner.buildTeammateAddendum(teamName, memberName, otherMembers);
+
+        // 可选的 worktree 隔离
+        String workdir = null;
+        if ("worktree".equalsIgnoreCase(isolation) && worktreeManager != null) {
+            try {
+                AgentWorktree.Result wt = AgentWorktree.create(worktreeManager, "HEAD");
+                workdir = wt.worktreePath();
+                String notice = AgentWorktree.buildNotice(workDir, wt.worktreePath());
+                prompt = notice + "\n\n" + prompt;
+            } catch (RuntimeException e) {
+                return ToolResult.error("Error: 创建 teammate Worktree 失败：" + e.getMessage());
+            }
+        }
+
+        // 补齐 teammate 元信息，让 config.json 里带上 agent 类型、模型和 worktree 路径
+        team.setMemberMeta(memberName, def.agentType(), modelOverride, workdir);
+
+        try {
+            var spawnResult = SpawnDispatcher.spawnTeammate(
+                    new SpawnDispatcher.SpawnConfig(
+                            team, memberName, prompt, addendum,
+                            subClient, subRegistry, protocol,
+                            providerConfigForSpawn(), workdir,
+                            teammateChecker(planModeRequired)));
+            return ToolResult.success(
+                    "Teammate \"%s\" spawned in team \"%s\" (mode: %s). The teammate is now working on the assigned task."
+                            .formatted(memberName, teamName, spawnResult.mode()));
+        } catch (Exception e) {
+            return ToolResult.error("Error spawning teammate: " + e.getMessage());
+        }
+    }
+
+    /**
+     * 标了 plan_mode_required 的 teammate 以计划模式启动：只能读不能改，
+     * 写出计划交 Lead 审批，通过后才切回正常权限。
+     */
+    private PermissionChecker teammateChecker(boolean planModeRequired) {
+        if (!planModeRequired) {
+            // 普通 teammate 不带检查器，沿用既有行为
+            return null;
+        }
+        Path root = Path.of(workDir != null ? workDir : System.getProperty("user.dir"));
+        return new PermissionChecker(PermissionMode.PLAN, root);
+    }
+
+    /** SpawnDispatcher 兜底用的 provider 配置：AgentTool 只持有 prompt 与协议，这里传 null 走默认构造。 */
+    private com.agentjava.config.ProviderConfig providerConfigForSpawn() {
+        return null;
     }
 
     // ───────────────────────── Fork 路径 ─────────────────────────
