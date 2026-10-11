@@ -2,6 +2,7 @@ package com.agentjava.tui;
 
 import com.agentjava.agent.Agent;
 import com.agentjava.agent.AgentEvent;
+import com.agentjava.agent.StreamingExecutor;
 import com.agentjava.command.CommandContext;
 import com.agentjava.command.CommandParser;
 import com.agentjava.command.CommandRegistry;
@@ -10,6 +11,12 @@ import com.agentjava.command.UIController;
 import com.agentjava.compact.ContextCompactor;
 import com.agentjava.compact.RecoveryState;
 import com.agentjava.config.ProviderConfig;
+import com.agentjava.hook.EventName;
+import com.agentjava.hook.Hook;
+import com.agentjava.hook.HookConfig;
+import com.agentjava.hook.HookContext;
+import com.agentjava.hook.HookEngine;
+import com.agentjava.hook.HookResult;
 import com.agentjava.conversation.ConversationManager;
 import com.agentjava.history.HistoryStore;
 import com.agentjava.llm.LlmClient;
@@ -39,6 +46,7 @@ import com.agentjava.tui.tea.WindowSizeMessage;
 
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
@@ -72,6 +80,11 @@ import java.util.concurrent.TimeUnit;
  * 注册成斜杠命令、实现 {@link SkillForkHost} 给 fork 模式提供隔离子 Agent 运行时。
  * 之所以落在这一层而不是 {@link Agent} 里，是因为「起一个子 Agent」需要 LLM 客户端
  * 与 provider，这两样只在 TUI 启动时才确定。
+ *
+ * <p>它再添一个身份：<b>Hook 宿主</b>。会话级（session_start/end）、轮次级
+ * （turn_start/end）、{@code error}、{@code command_execute} 这几个事件的插入点都在这一层；
+ * 消息级与工具级的在 {@link Agent} 与 {@link StreamingExecutor} 里。prompt 类型 Hook 的输出
+ * 也要由它在每轮收尾时取走并注入对话——往对话里写东西只有它握得住。
  *
  * <p>{@code com.agentjava.tui.tea.Command}（TEA 的副作用指令）与
  * {@code com.agentjava.command.Command}（Slash Command 定义）同名，后面一律用全限定名区分。
@@ -167,6 +180,30 @@ public class AgentModel implements Model, UIController {
      */
     private final Set<String> announcedSkills = new LinkedHashSet<>();
 
+    // ─────────────────── Hook 生命周期钩子 ───────────────────
+
+    /**
+     * Hook 引擎：启动时从三处配置追加合并加载，之后在生命周期节点上被触发。
+     * 会话级 / 轮次级的插入点在 TUI 这一层，消息级与工具级的由 {@link Agent} 与
+     * {@link StreamingExecutor} 各自持有同一个实例去触发。
+     */
+    private HookEngine hookEngine;
+
+    /** 配置里解析不出、或校验没过的条目，攒着给 {@code /hooks} 展示。 */
+    private final List<String> hookErrors = new ArrayList<>();
+
+    /** 启动期的一行状态：加载了几条 Hook、有没有配置问题。 */
+    private String hookStatus = "";
+
+    /**
+     * Hook 运行期的错误日志。
+     *
+     * <p>Hook 跑在 Agent 的虚拟线程上，直接往终端写会跟全屏界面打架，往
+     * {@link #pendingSystemMessages} 里塞又要担心并发。攒进同步列表、由 {@code /hooks}
+     * 展示最稳妥——反正是辅助机制，出错只要能查到就够。
+     */
+    private final List<String> hookLog = Collections.synchronizedList(new ArrayList<>());
+
     /** 自动压缩熔断器，跨轮次累积。 */
     private final ContextCompactor.AutoCompactTrackingState breaker =
             new ContextCompactor.AutoCompactTrackingState();
@@ -261,9 +298,17 @@ public class AgentModel implements Model, UIController {
         // Skill 装配要在记忆装配之前：Skill 清单和记忆索引进的是同一条 system-reminder，
         // 而记忆注入只在「对话为空」时动作，顺序反了会把清单挤到助手消息之后
         bootstrapSkills();
+        // Hook 装配放在记忆之前：session_start 的 prompt 类 Hook 要注入对话，
+        // 而记忆装配在最后会把 persistedCount 对齐到「注入完成」的位置
+        bootstrapHooks();
         // 记忆装配放在最后：它要往对话里注入内容，得等 provider 选择分支确定之后再做，
         // 保证无论走哪条路径都注入一次
         bootstrapMemory();
+        // 系统级与会话级的开场事件：startup 先于 session_start（启动 → 开会话）
+        fireHook(HookContext.of(EventName.STARTUP));
+        fireHook(HookContext.of(EventName.SESSION_START));
+        flushHookNotifications();
+        persistedCount = conversation.size();
     }
 
     /**
@@ -496,6 +541,147 @@ public class AgentModel implements Model, UIController {
         return text + " ".repeat(Math.max(1, width - w));
     }
 
+    // ───────────────────────── Hook 装配 ─────────────────────────
+
+    /**
+     * 启动时装配 Hook 系统：加载 → 逐条校验 → 注册 → 登记 {@code /hooks} 命令。
+     *
+     * <p><b>坏规则单独丢弃，不影响其它规则</b>：配置文件是人手写的，一处笔误不该让整个
+     * Hook 系统失效，更不该让 Agent 起不来。解析失败和校验失败都只是跳过那一条，
+     * 并攒进 {@link #hookErrors} 等 {@code /hooks} 展示。
+     *
+     * <p>agent 类型的执行器这里<b>不注册</b>：这里只搭接口与骨架，真实子 Agent 运行时
+     * 交给 SubAgent。未注册时执行器返回一句明确说明，而不是抛异常。
+     */
+    private void bootstrapHooks() {
+        hookEngine = new HookEngine();
+        hookEngine.setWorkDir(workingDir);
+        hookEngine.setLogger(msg -> {
+            hookLog.add(msg);
+            if (hookLog.size() > 30) {
+                hookLog.remove(0);
+            }
+        });
+
+        var loaded = HookConfig.load(workingDir);
+        List<Hook> valid = new ArrayList<>();
+        for (int i = 0; i < loaded.hooks().size(); i++) {
+            Hook h = loaded.hooks().get(i);
+            List<String> errs = HookEngine.validate(h, "hooks[" + i + "]");
+            if (errs.isEmpty()) {
+                valid.add(h);
+            } else {
+                hookErrors.addAll(errs);
+            }
+        }
+        hookErrors.addAll(loaded.errors());
+        hookEngine.registerAll(valid);
+
+        if (!valid.isEmpty()) {
+            hookStatus = Styles.ACCENT.render("✻ 已加载 " + valid.size() + " 条 Hook（/hooks 查看）");
+        }
+        if (!hookErrors.isEmpty()) {
+            hookStatus = (hookStatus.isEmpty() ? "" : hookStatus + "\n")
+                    + Styles.ERROR.render("⚠ Hook 配置有 " + hookErrors.size()
+                    + " 处问题，相关规则已跳过（/hooks 看详情）");
+        }
+
+        commands.register(new com.agentjava.command.Command(
+                "hooks", "Hook 管理：查看已加载的生命周期钩子", new String[]{},
+                CommandType.LOCAL, "/hooks", "", this::handleHooks));
+    }
+
+    /** 触发一个通知型事件；没有 Hook 引擎时是空操作。 */
+    private List<HookResult> fireHook(HookContext ctx) {
+        if (hookEngine == null) {
+            return List.of();
+        }
+        return hookEngine.runHooks(ctx);
+    }
+
+    /**
+     * 把本轮攒下的 prompt 类 Hook 输出注入对话。
+     *
+     * <p>格式是 {@code <system-reminder>} 包一层、里面每条一个
+     * {@code <hook-notification>}。走 messages 而不是 System Prompt，
+     * 是为了不让 System Prompt 跟着项目变——它一变，Prompt Cache 的整段前缀就失效了。
+     */
+    private void flushHookNotifications() {
+        if (hookEngine == null) {
+            return;
+        }
+        var results = hookEngine.drainNotifications();
+        List<String> prompts = new ArrayList<>();
+        for (HookResult r : results) {
+            if (r.isPromptNotification()) {
+                prompts.add(r.output().strip());
+            }
+        }
+        if (prompts.isEmpty()) {
+            return;
+        }
+        StringBuilder sb = new StringBuilder("以下提示来自生命周期 Hook，请纳入考虑：\n");
+        for (String p : prompts) {
+            sb.append("<hook-notification>\n").append(p).append("\n</hook-notification>\n");
+        }
+        conversation.addSystemReminder(sb.toString());
+    }
+
+    /** {@code /hooks}：列出已加载的 Hook 与配置问题。 */
+    private String handleHooks(CommandContext ctx) {
+        if (hookEngine == null) {
+            return "（Hook 系统未初始化）";
+        }
+        var hooks = hookEngine.hooks();
+        StringBuilder sb = new StringBuilder();
+        if (hooks.isEmpty()) {
+            sb.append("（还没有配置任何 Hook）\n\n把 hooks 写进下面任一文件即可自动加载：\n")
+                    .append("  项目级：").append(Path.of(workingDir, HookConfig.PROJECT_PATH)).append('\n')
+                    .append("  用户级：").append(HookConfig.globalPath()).append('\n')
+                    .append("  本地级：").append(Path.of(workingDir, HookConfig.LOCAL_PATH))
+                    .append("（不进 git，放本地临时改动）\n\n")
+                    .append("三处配置是<b>追加合并</b>的，不是找到一个就停。");
+        } else {
+            sb.append("已加载 Hook（").append(hooks.size()).append(" 条）\n\n");
+            for (Hook h : hooks) {
+                sb.append("  ").append(pad(h.event().value(), 20))
+                        .append(pad(h.label(), 22))
+                        .append(pad(h.source().isEmpty() ? "-" : h.source(), 8));
+                sb.append(h.action() == null ? "（缺 action）" : h.action().type().value());
+                sb.append(h.reject() ? "  reject" : "");
+                sb.append(h.once() ? "  once" : "");
+                sb.append(h.async() ? "  async" : "");
+                sb.append('\n');
+                sb.append("      if: ").append(h.condition().display()).append('\n');
+                sb.append("      →  ").append(h.action() == null ? "" : h.action().summary()).append('\n');
+            }
+            sb.append("\n声明顺序即执行顺序：pre_tool_use 上第一个命中的 reject 会短路后面的规则。");
+        }
+        if (!hookErrors.isEmpty()) {
+            sb.append("\n\n配置问题（").append(hookErrors.size()).append("）：\n");
+            for (String e : hookErrors) {
+                sb.append("  ✗ ").append(e).append('\n');
+            }
+        }
+        if (!hookLog.isEmpty()) {
+            sb.append("\n\n运行日志（最近 ").append(hookLog.size()).append(" 条，Hook 出错不影响主流程）：\n");
+            for (String line : hookLog) {
+                sb.append("  · ").append(line).append('\n');
+            }
+        }
+        return sb.toString();
+    }
+
+    /** 程序退出时调用：补一次 session_end + shutdown。 */
+    public void fireShutdownHooks() {
+        if (hookEngine == null) {
+            return;
+        }
+        hookEngine.runHooks(HookContext.of(EventName.SESSION_END));
+        hookEngine.runHooks(HookContext.of(EventName.SHUTDOWN));
+        hookEngine.shutdown();
+    }
+
     // ───────────────────────── SkillHost 实现 ─────────────────────────
 
     /**
@@ -613,6 +799,9 @@ public class AgentModel implements Model, UIController {
                 if (!mcpStatus.isEmpty()) {
                     sb.append("\n").append(mcpStatus);
                 }
+                if (!hookStatus.isEmpty()) {
+                    sb.append("\n").append(hookStatus);
+                }
                 return UpdateResult.of(this, Command.println(sb.toString()));
             }
             return UpdateResult.of(this);
@@ -705,6 +894,8 @@ public class AgentModel implements Model, UIController {
         if (!parsed.isCommand()) {
             return startAgentTurn(text);
         }
+        // command_execute：Slash Command 执行前通知一声
+        fireHook(HookContext.of(EventName.COMMAND_EXECUTE, text));
         return dispatchSlashCommand(parsed);
     }
 
@@ -859,6 +1050,8 @@ public class AgentModel implements Model, UIController {
     private Command startAgentTurn(String text) {
         // 每轮开工前先看一眼 Skill 目录：用户可能刚往里丢了一个新 Skill
         refreshSkillsIfNeeded();
+        // turn_start：一轮对话开始的节点
+        fireHook(HookContext.of(EventName.TURN_START, text));
         // 用户输入先写进 scrollback，再进历史：即使请求失败也能看到自己问了什么
         Command echo = Command.println(Styles.PROMPT.render("❯ ") + Styles.USER.render(text));
         conversation.addUserMessage(text);
@@ -888,6 +1081,7 @@ public class AgentModel implements Model, UIController {
         agent.setSessionId(sessionId);
         agent.setRecovery(recovery);
         agent.setBreaker(breaker);
+        agent.setHookEngine(hookEngine);
         BlockingQueue<AgentEvent> queue = agent.run(conversation);
         Thread.startVirtualThread(() -> pumpAgentEvents(queue));
         return echo;
@@ -937,6 +1131,7 @@ public class AgentModel implements Model, UIController {
         }
         // 压缩要把 marker 落到会话存档里，否则下次恢复只能全量回放被压缩掉的历史
         writeCompactBoundary();
+        fireHook(HookContext.of(EventName.COMPACT));
         int after = ContextCompactor.estimateTokens(conversation.getMessages());
         return Styles.ACCENT.render("✻ 已压缩: " + before + " → " + after + " estimated tokens");
     }
@@ -947,6 +1142,9 @@ public class AgentModel implements Model, UIController {
      * <p>旧的对话不会丢，随时能用 {@code /session list} 找到、用 {@code /resume} 回去。
      */
     private String startNewSession() {
+        // session_end：旧会话结束；清空之后再补一次 session_start
+        fireHook(HookContext.of(EventName.SESSION_END));
+        flushHookNotifications();
         flushSession();
         conversation.clear();
         sessionId = SessionManager.newId();
@@ -957,6 +1155,13 @@ public class AgentModel implements Model, UIController {
         recovery.clearSkills();
         // 重新装配一次记忆索引：清空后对话为空，注入才会发生
         bootstrapMemory();
+        // once 的语义是「本次会话只触发一次」，换了会话就该重新算
+        if (hookEngine != null) {
+            hookEngine.resetExecuted();
+        }
+        fireHook(HookContext.of(EventName.SESSION_START));
+        flushHookNotifications();
+        persistedCount = conversation.size();
         usageAvailable = false;
         lastInputTokens = 0;
         lastOutputTokens = 0;
@@ -1147,6 +1352,9 @@ public class AgentModel implements Model, UIController {
         long elapsed = System.currentTimeMillis() - requestStartMillis;
         streaming = false;
         streamBuf.setLength(0);
+        // turn_end：一轮收尾，Hook 的 prompt 输出在这里取走并注入，下一轮 LLM 就能看到
+        fireHook(HookContext.of(EventName.TURN_END));
+        flushHookNotifications();
 
         if (fullText.isBlank()) {
             return Command.println(Styles.MUTED.render("（本轮没有返回文本内容）"));
@@ -1169,6 +1377,10 @@ public class AgentModel implements Model, UIController {
                 .noneMatch(m -> partial.equals(m.getContent()))) {
             conversation.addAssistantMessage(partial);
         }
+        // error + turn_end：出错也要收尾，否则 turn_end 上的 Hook 永远等不到这一轮
+        fireHook(HookContext.of(EventName.ERROR, message));
+        fireHook(HookContext.of(EventName.TURN_END));
+        flushHookNotifications();
         return Command.println(Styles.ERROR.render("✗ " + message));
     }
 

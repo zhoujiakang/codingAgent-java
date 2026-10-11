@@ -6,6 +6,9 @@ import com.agentjava.conversation.ToolResultBudget;
 import com.agentjava.conversation.ToolUseBlock;
 import com.agentjava.compact.ContextCompactor;
 import com.agentjava.compact.RecoveryState;
+import com.agentjava.hook.EventName;
+import com.agentjava.hook.HookContext;
+import com.agentjava.hook.HookEngine;
 import com.agentjava.llm.LlmClient;
 import com.agentjava.llm.StreamEvent;
 import com.agentjava.permission.PermissionChecker;
@@ -70,6 +73,14 @@ public class Agent {
 
     /** 紧急压缩重试计数：API 返回上下文超长时最多重试 3 次。 */
     private int contextRetries = 0;
+
+    /**
+     * Hook 引擎；由 TUI 层注入并透传给 {@link StreamingExecutor}。
+     *
+     * <p>消息级（{@code pre_send} / {@code post_receive}）与 {@code compact} 事件的插入点
+     * 在主循环里，工具级那几个在 {@link StreamingExecutor} 里。为 null 时全部退化成空操作。
+     */
+    private HookEngine hookEngine;
 
     public Agent(LlmClient client, ToolRegistry registry, String protocol, String baseSystemPrompt) {
         this.client = client;
@@ -137,6 +148,11 @@ public class Agent {
         }
     }
 
+    /** 注入 Hook 引擎；为 null 表示没有配置任何 Hook。 */
+    public void setHookEngine(HookEngine hookEngine) {
+        this.hookEngine = hookEngine;
+    }
+
     /**
      * 启动 Agent Loop，立即返回一个事件队列。循环跑在后台虚拟线程里，
      * 调用方拿到队列后逐个取事件即可（最后一个事件一定是 LoopComplete 或 ErrorEvent）。
@@ -199,7 +215,11 @@ public class Agent {
                 if (!compactSummary.isEmpty()) {
                     int postTokens = ContextCompactor.currentTokens(conv.getMessages(), null);
                     putSafe(queue, new AgentEvent.CompactingEvent(preTokens, postTokens));
+                    fireHook(HookContext.of(EventName.COMPACT));
                 }
+
+                // pre_send：请求发出之前的最后一道口子（消息预处理）
+                fireHook(HookContext.of(EventName.PRE_SEND));
 
                 // 调 LLM，拿事件队列
                 var streamQueue = client.stream(conv, schemas);
@@ -266,6 +286,9 @@ public class Agent {
                     }
                 }
 
+                // post_receive：响应收完之后（消息后处理）
+                fireHook(HookContext.of(EventName.POST_RECEIVE));
+
                 // 流出错：若是上下文超长，紧急压缩后重试本轮请求（不把错误写进历史）
                 if (streamError) {
                     if (isContextTooLong(lastError) && contextRetries < 3) {
@@ -302,7 +325,7 @@ public class Agent {
                 }
 
                 // 执行工具：分批 + 只读并发，执行前经权限检查器逐层判定
-                var executor = new StreamingExecutor(registry, queue, checker);
+                var executor = new StreamingExecutor(registry, queue, checker, hookEngine);
                 var callInfos = toolCalls.stream()
                         .map(tc -> new StreamingExecutor.ToolCallInfo(tc.toolId(), tc.toolName(), tc.args()))
                         .toList();
@@ -348,6 +371,13 @@ public class Agent {
             if (!loopCompleted) {
                 putSafe(queue, new AgentEvent.LoopComplete(0));
             }
+        }
+    }
+
+    /** 触发一个通知型事件；没有 Hook 引擎时是空操作。 */
+    private void fireHook(HookContext ctx) {
+        if (hookEngine != null) {
+            hookEngine.runHooks(ctx);
         }
     }
 

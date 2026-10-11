@@ -68,6 +68,9 @@ public class AgentJava {
         } catch (IOException e) {
             System.err.println("无法启动终端界面：" + e.getMessage());
             System.exit(1);
+        } finally {
+            // shutdown + session_end：正常退出时补一次收尾事件
+            model.fireShutdownHooks();
         }
     }
 

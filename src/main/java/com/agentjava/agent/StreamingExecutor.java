@@ -1,5 +1,8 @@
 package com.agentjava.agent;
 
+import com.agentjava.hook.EventName;
+import com.agentjava.hook.HookContext;
+import com.agentjava.hook.HookEngine;
 import com.agentjava.permission.PermissionChecker;
 import com.agentjava.permission.PermissionMode;
 import com.agentjava.permission.PermissionResponse;
@@ -11,6 +14,7 @@ import com.agentjava.tool.ToolResult;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executors;
@@ -25,12 +29,27 @@ import java.util.concurrent.TimeUnit;
  * 每执行一个工具前先过一遍 {@link PermissionChecker}：被拒绝（DENY）或用户拒绝
  * 都包成 isError 的工具结果回灌给模型（不终止循环，让模型自己调整策略）；
  * 需要确认（ASK）则发 {@link AgentEvent.PermissionRequestEvent} 并阻塞等待 UI 回复。
+ *
+ * <p>它也是 Hook 在工具级的四个插入点：
+ * <ul>
+ *   <li>{@code permission_request}：弹确认窗之前；</li>
+ *   <li>{@code pre_tool_use}：权限通过之后、真正执行之前——<b>唯一能拦截的地方</b>，
+ *       被拦下就把拒绝原因包成 isError 的工具结果回灌给 LLM；</li>
+ *   <li>{@code post_tool_use}：执行之后；</li>
+ *   <li>{@code file_change}：写类工具成功改动了文件之后。</li>
+ * </ul>
  */
 public class StreamingExecutor {
+
+    /** 会被 {@code file_change} 事件认作「改了文件」的工具。 */
+    private static final Set<String> FILE_WRITE_TOOLS = Set.of("WriteFile", "EditFile");
 
     private final ToolRegistry registry;
     private final BlockingQueue<AgentEvent> eventQueue;
     private final PermissionChecker checker;
+
+    /** Hook 引擎；没配置 Hook 时为 null，所有插入点自动退化成空操作。 */
+    private final HookEngine hookEngine;
 
     public record ToolCallInfo(String toolId, String toolName, Map<String, Object> args) {
     }
@@ -39,9 +58,15 @@ public class StreamingExecutor {
     }
 
     public StreamingExecutor(ToolRegistry registry, BlockingQueue<AgentEvent> eventQueue, PermissionChecker checker) {
+        this(registry, eventQueue, checker, null);
+    }
+
+    public StreamingExecutor(ToolRegistry registry, BlockingQueue<AgentEvent> eventQueue,
+                             PermissionChecker checker, HookEngine hookEngine) {
         this.registry = registry;
         this.eventQueue = eventQueue;
         this.checker = checker;
+        this.hookEngine = hookEngine;
     }
 
     /**
@@ -131,6 +156,19 @@ public class StreamingExecutor {
             checker.appendLocalRule(call.toolName(), PermissionChecker.buildAlwaysAllowPattern(call.toolName(), content));
         }
 
+        // pre_tool_use：权限通过之后、真正执行之前。这是唯一能拦住工具调用的位置，
+        // 被拦下就把 Hook 的输出当错误信息回灌——LLM 看到原因会自己换策略。
+        // 顺序上排在权限之后，是因为权限没过的调用根本不会执行，没必要再问 Hook。
+        if (hookEngine != null) {
+            var rejected = hookEngine.runPreToolHooks(
+                    HookContext.ofTool(EventName.PRE_TOOL_USE, call.toolName(), call.args()));
+            if (rejected.isPresent()) {
+                String msg = "Rejected by hook: " + rejected.get().reason();
+                putSafe(new AgentEvent.ToolResultEvent(call.toolId(), call.toolName(), msg, true, 0));
+                return new ToolExecResult(call.toolId(), msg, true);
+            }
+        }
+
         long start = System.nanoTime();
         ToolResult result;
         try {
@@ -139,6 +177,18 @@ public class StreamingExecutor {
             result = ToolResult.error("Tool execution error: " + e.getMessage());
         }
         double elapsed = (System.nanoTime() - start) / 1_000_000_000.0;
+
+        // post_tool_use：执行之后的通知型事件
+        if (hookEngine != null) {
+            hookEngine.runHooks(HookContext.ofTool(
+                    EventName.POST_TOOL_USE, call.toolName(), call.args()));
+        }
+        // file_change：写类工具成功改动了文件之后
+        if (hookEngine != null && !result.isError() && FILE_WRITE_TOOLS.contains(call.toolName())
+                && call.args() != null && call.args().get("file_path") instanceof String fp) {
+            hookEngine.runHooks(new HookContext(EventName.FILE_CHANGE, call.toolName(),
+                    call.args(), fp, null, null));
+        }
 
         putSafe(new AgentEvent.ToolResultEvent(
                 call.toolId(), call.toolName(), result.output(), result.isError(), elapsed));
@@ -149,6 +199,11 @@ public class StreamingExecutor {
     private PermissionResponse askUserPermission(ToolCallInfo call) {
         var future = new CompletableFuture<PermissionResponse>();
         String desc = checker.describeToolAction(call.toolName(), call.args());
+        // permission_request：弹窗之前先通知一声，审计类 Hook 靠它记录「问过什么」
+        if (hookEngine != null) {
+            hookEngine.runHooks(new HookContext(EventName.PERMISSION_REQUEST, call.toolName(),
+                    call.args(), null, desc, null));
+        }
         putSafe(new AgentEvent.PermissionRequestEvent(call.toolName(), desc, future));
         try {
             return future.get(5, TimeUnit.MINUTES);
