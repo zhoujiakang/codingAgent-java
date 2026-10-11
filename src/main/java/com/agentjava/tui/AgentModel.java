@@ -31,6 +31,10 @@ import com.agentjava.prompt.PromptBuilder;
 import com.agentjava.session.SessionManager;
 import com.agentjava.session.SessionMessage;
 import com.agentjava.skill.SkillCatalog;
+import com.agentjava.subagent.AgentLoader;
+import com.agentjava.subagent.AgentTool;
+import com.agentjava.subagent.SubAgentTaskManager;
+import com.agentjava.subagent.TraceRegistry;
 import com.agentjava.skill.SkillExecutor;
 import com.agentjava.skill.SkillForkHost;
 import com.agentjava.tool.ToolRegistry;
@@ -204,6 +208,26 @@ public class AgentModel implements Model, UIController {
      */
     private final List<String> hookLog = Collections.synchronizedList(new ArrayList<>());
 
+    // ─────────────────── SubAgent 子任务分发 ───────────────────
+
+    /** 后台子 Agent 任务管理器：登记、等待、取消、通知回传。 */
+    private SubAgentTaskManager taskManager;
+
+    /** 父子链路追踪：调用链 / Token 消耗 / 执行状态。只活在内存里，不做跨会话持久化。 */
+    private TraceRegistry traceRegistry;
+
+    /**
+     * 统一的 Agent 工具。注册进 {@link #registry} 之后，模型派子 Agent 跟调 ReadFile
+     * 没有区别；它需要的 LLM 客户端、协议、System Prompt 在 provider 激活时补齐。
+     */
+    private AgentTool agentTool;
+
+    /** Agent 定义文件解析失败清单，启动期提示、{@code /tasks} 可查。 */
+    private final List<String> agentErrors = new ArrayList<>();
+
+    /** 启动期的一行状态：有几个子 Agent 可用。 */
+    private String agentStatus = "";
+
     /** 自动压缩熔断器，跨轮次累积。 */
     private final ContextCompactor.AutoCompactTrackingState breaker =
             new ContextCompactor.AutoCompactTrackingState();
@@ -288,6 +312,8 @@ public class AgentModel implements Model, UIController {
                 mcpStatus = Styles.ERROR.render("⚠ MCP 初始化失败: " + e.getMessage());
             }
         }
+        // 子 Agent 装配要早于 provider 激活：activateProvider 里要把客户端回灌给 AgentTool
+        bootstrapSubAgents();
         // 只有一个 provider 时直接进入对话，多个时才让用户选（F2）
         if (this.providers.size() == 1) {
             this.state = AppState.CHAT;
@@ -541,6 +567,226 @@ public class AgentModel implements Model, UIController {
         return text + " ".repeat(Math.max(1, width - w));
     }
 
+    // ───────────────────────── SubAgent 装配 ─────────────────────────
+
+    /**
+     * 启动时装配子 Agent 系统，四步：
+     * <ol>
+     *   <li>四级扫描 Agent 定义（插件 → 内置 → 用户 → 项目），同名后者覆盖前者；</li>
+     *   <li>建任务管理器与链路追踪；</li>
+     *   <li>注册统一的 Agent 工具，让模型可以像调普通工具一样派发子 Agent；</li>
+     *   <li>注册 {@code /tasks} 与 {@code /task} 两条管理命令。</li>
+     * </ol>
+     *
+     * <p>客户端相关的东西（LLM 客户端、协议、System Prompt、模型解析器）留给
+     * {@link #activateProvider} 补齐——这一章的子 Agent 是在对话中按需创建的，
+     * 启动时 provider 可能还没选。
+     */
+    private void bootstrapSubAgents() {
+        taskManager = new SubAgentTaskManager();
+        traceRegistry = new TraceRegistry();
+
+        var loaded = AgentLoader.loadAll(Path.of(workingDir));
+        agentErrors.addAll(loaded.errors());
+
+        agentTool = new AgentTool(registry);
+        agentTool.setAgentDefinitions(loaded.definitions());
+        agentTool.setTaskManager(taskManager);
+        agentTool.setTrace(traceRegistry);
+        agentTool.setParentConversation(conversation);
+        agentTool.setWorkDir(workingDir);
+        registry.register(agentTool);
+
+        var names = AgentLoader.listNames(loaded.definitions());
+        agentStatus = Styles.ACCENT.render("✻ 子 Agent：" + names.size() + " 个可用（"
+                + String.join("、", names) + "）");
+        if (!agentErrors.isEmpty()) {
+            agentStatus += "\n" + Styles.ERROR.render("⚠ 有 " + agentErrors.size()
+                    + " 个 Agent 定义文件解析失败（/tasks 看详情）");
+        }
+
+        commands.register(new com.agentjava.command.Command(
+                "tasks", "子 Agent：可用类型 + 后台任务 + 调用链", new String[]{"agents"},
+                CommandType.LOCAL, "/tasks", "", this::handleTasks));
+        commands.register(new com.agentjava.command.Command(
+                "task", "子 Agent 任务管理：info / cancel", new String[]{},
+                CommandType.LOCAL, "/task info <任务 ID>",
+                "用法：/task info <任务 ID> · /task cancel <任务 ID>", this::handleTask));
+    }
+
+    /** {@code /tasks}：可用 Agent 类型 + 后台任务列表 + 调用链。 */
+    private String handleTasks(CommandContext ctx) {
+        if (taskManager == null) {
+            return "（子 Agent 系统未初始化）";
+        }
+        var sb = new StringBuilder();
+        var tasks = taskManager.listTasks();
+        if (tasks.isEmpty()) {
+            sb.append("（还没有启动过子 Agent）\n\n")
+                    .append("用 Agent 工具派发子任务；传 run_in_background: true 让它在后台跑，\n")
+                    .append("留空 subagent_type 走 Fork 路径（继承当前对话，总是后台执行）。\n");
+        } else {
+            sb.append("后台任务（").append(tasks.size()).append(" 个，")
+                    .append(taskManager.runningCount()).append(" 个在跑）\n\n");
+            for (var t : tasks) {
+                sb.append("  ").append(pad(t.id(), 12))
+                        .append(pad(taskStatusLabel(t.status()), 10))
+                        .append(t.name()).append('\n');
+                if (t.backgrounded()) {
+                    sb.append("      （已被 ESC 切到后台）\n");
+                }
+                if (t.error() != null && !t.error().isBlank()) {
+                    sb.append("      错误：").append(t.error()).append('\n');
+                }
+            }
+            sb.append("\n/task info <任务 ID> 看详情 · /task cancel <任务 ID> 取消");
+        }
+
+        var defs = agentTool == null ? Map.<String, com.agentjava.subagent.AgentDefinition>of()
+                : agentTool.getAgentDefinitions();
+        if (!defs.isEmpty()) {
+            sb.append("\n\n可用 subagent_type（项目级 > 用户级 > 内置级 > 插件级）：\n");
+            for (String name : AgentLoader.listNames(defs)) {
+                var def = defs.get(name);
+                sb.append("  ").append(pad(name, 20)).append(def.whenToUse()).append('\n');
+            }
+            sb.append("  留空则走 Fork 路径");
+        }
+
+        if (traceRegistry != null && !traceRegistry.summary().isEmpty()) {
+            sb.append("\n\n调用链：").append(traceRegistry.summary()).append('\n')
+                    .append(traceRegistry.render()).append('\n');
+        }
+        if (!agentErrors.isEmpty()) {
+            sb.append("\n\n定义文件问题（").append(agentErrors.size()).append("）：\n");
+            for (String e : agentErrors) {
+                sb.append("  ✗ ").append(e).append('\n');
+            }
+        }
+        return sb.toString().stripTrailing();
+    }
+
+    /** {@code /task info <id>} · {@code /task cancel <id>}。 */
+    private String handleTask(CommandContext ctx) {
+        if (taskManager == null) {
+            return "（子 Agent 系统未初始化）";
+        }
+        String[] parts = splitOnce(ctx.args());
+        return switch (parts[0]) {
+            case "info" -> taskInfo(parts[1]);
+            case "cancel", "stop" -> taskCancel(parts[1]);
+            default -> "未知子命令：" + parts[0]
+                    + "\n用法：/task info <任务 ID> · /task cancel <任务 ID>";
+        };
+    }
+
+    private String taskInfo(String rawId) {
+        String id = rawId == null ? "" : rawId.strip();
+        if (id.isEmpty()) {
+            return "用法：/task info <任务 ID>（列表见 /tasks）";
+        }
+        var task = taskManager.getTask(id);
+        if (task == null) {
+            return "✗ 找不到任务: " + id;
+        }
+        var sb = new StringBuilder();
+        sb.append("任务 ").append(task.id()).append(" · ").append(task.agentType()).append('\n');
+        sb.append("  名称：").append(task.name()).append('\n');
+        sb.append("  状态：").append(taskStatusLabel(task.status()));
+        if (task.backgrounded()) {
+            sb.append("（已转后台）");
+        }
+        sb.append('\n');
+        sb.append("  耗时：").append(formatMillis(
+                (task.endMillis() == null ? System.currentTimeMillis() : task.endMillis())
+                        - task.startMillis())).append('\n');
+        if (task.error() != null && !task.error().isBlank()) {
+            sb.append("  错误：").append(task.error()).append('\n');
+        }
+        if (task.output() != null && !task.output().isBlank()) {
+            sb.append("  输出：").append(previewResult(task.output())).append('\n');
+        }
+        if (traceRegistry != null && traceRegistry.get(id) != null) {
+            sb.append("\n调用链：\n").append(traceRegistry.render());
+        }
+        return sb.toString().stripTrailing();
+    }
+
+    private String taskCancel(String rawId) {
+        String id = rawId == null ? "" : rawId.strip();
+        if (id.isEmpty()) {
+            return "用法：/task cancel <任务 ID>（列表见 /tasks）";
+        }
+        return taskManager.cancelTask(id)
+                ? Styles.ACCENT.render("✻ 已取消任务 " + id)
+                : "✗ 取消失败: " + id + "（不存在或已经结束）";
+    }
+
+    /**
+     * 把后台任务的完成通知注入对话。
+     *
+     * <p>走 messages 而不是 System Prompt，理由跟 Hook 通知一样：不让 System Prompt
+     * 跟着变，Prompt Cache 的前缀才不会失效。顺带把链路追踪的最终状态回填——
+     * 后台任务没有人在同步等它，只有这里能拿到它的结局。
+     */
+    private void flushTaskNotifications() {
+        if (taskManager == null) {
+            return;
+        }
+        var notes = taskManager.drainNotifications();
+        if (notes.isEmpty()) {
+            return;
+        }
+        var sb = new StringBuilder("后台子 Agent 任务有更新：\n");
+        for (var n : notes) {
+            if (traceRegistry != null && traceRegistry.get(n.taskId()) != null) {
+                traceRegistry.finish(n.taskId(), TraceRegistry.fromTaskStatus(n.status()));
+            }
+            sb.append("<task-notification>\n")
+                    .append("任务 ").append(n.taskId())
+                    .append(" · ").append(n.agentType())
+                    .append(" · ").append(taskStatusLabel(n.status())).append('\n')
+                    .append(n.output() == null || n.output().isBlank() ? "（无文本输出）" : n.output())
+                    .append("\n</task-notification>\n");
+        }
+        conversation.addSystemReminder(sb.toString());
+    }
+
+    /**
+     * ESC：把正在前台等待的子 Agent 切到后台。
+     *
+     * <p>中断的只是「等待」那一条线程，worker 虚拟线程继续跑完，结果仍会回传。
+     * 没有正在等待的任务时 ESC 什么都不做——它不承担「中断当前回复」的职责。
+     */
+    private Command handleEscape() {
+        if (taskManager == null) {
+            return Command.none();
+        }
+        String id = taskManager.switchForegroundToBackground();
+        if (id == null) {
+            return Command.none();
+        }
+        return Command.println(Styles.ACCENT.render("✻ 子 Agent 任务 " + id
+                + " 已转入后台，结果会通过 task-notification 回传（/task info " + id + " 查看）"));
+    }
+
+    private static String taskStatusLabel(SubAgentTaskManager.TaskStatus status) {
+        if (status == null) {
+            return "未知";
+        }
+        return switch (status) {
+            case PENDING -> "排队中";
+            case RUNNING -> "运行中";
+            case COMPLETED -> "已完成";
+            case FAILED -> "失败";
+            case CANCELLED -> "已取消";
+        };
+    }
+
+    private static String formatMillis(long millis) {
+        return millis < 1000 ? millis + "ms" : String.format(Locale.ROOT, "%.1fs", millis / 1000.0);
+    }
+
     // ───────────────────────── Hook 装配 ─────────────────────────
 
     /**
@@ -576,6 +822,11 @@ public class AgentModel implements Model, UIController {
         }
         hookErrors.addAll(loaded.errors());
         hookEngine.registerAll(valid);
+
+        // agent 类型动作的落地：接口此前只留骨架，这里接上真实的子 Agent 运行时
+        if (agentTool != null) {
+            hookEngine.setAgentRunner((prompt, ctx) -> agentTool.runHookAgent(prompt));
+        }
 
         if (!valid.isEmpty()) {
             hookStatus = Styles.ACCENT.render("✻ 已加载 " + valid.size() + " 条 Hook（/hooks 查看）");
@@ -781,6 +1032,11 @@ public class AgentModel implements Model, UIController {
         this.program = program;
     }
 
+    /** 工具注册中心（对外只读用途：查有没有注册上、列当前工具集）。 */
+    public ToolRegistry registry() {
+        return registry;
+    }
+
     // ───────────────────────── Model 接口实现 ─────────────────────────
 
     @Override
@@ -801,6 +1057,9 @@ public class AgentModel implements Model, UIController {
                 }
                 if (!hookStatus.isEmpty()) {
                     sb.append("\n").append(hookStatus);
+                }
+                if (!agentStatus.isEmpty()) {
+                    sb.append("\n").append(agentStatus);
                 }
                 return UpdateResult.of(this, Command.println(sb.toString()));
             }
@@ -850,6 +1109,10 @@ public class AgentModel implements Model, UIController {
         // 权限确认弹窗优先于普通输入：此时 Agent Loop 阻塞在 future 上，等待用户拍板
         if (awaitingPermission) {
             return handlePermissionKey(key);
+        }
+        // ESC 先于 streaming 判定：流式期间唯一还该响应的键就是它（切子 Agent 到后台）
+        if ("esc".equals(key.key())) {
+            return handleEscape();
         }
         if (streaming) {
             return Command.none();
@@ -1082,6 +1345,13 @@ public class AgentModel implements Model, UIController {
         agent.setRecovery(recovery);
         agent.setBreaker(breaker);
         agent.setHookEngine(hookEngine);
+        // 子 Agent 每轮都要重新对齐这几样：会话 ID 会随 /clear 变，权限模式会随 /mode 变，
+        // Hook 引擎在引擎装配完成前是 null
+        if (agentTool != null) {
+            agentTool.setSessionId(sessionId);
+            agentTool.setPermissionMode(permissionMode);
+            agentTool.setHookEngine(hookEngine);
+        }
         BlockingQueue<AgentEvent> queue = agent.run(conversation);
         Thread.startVirtualThread(() -> pumpAgentEvents(queue));
         return echo;
@@ -1355,6 +1625,8 @@ public class AgentModel implements Model, UIController {
         // turn_end：一轮收尾，Hook 的 prompt 输出在这里取走并注入，下一轮 LLM 就能看到
         fireHook(HookContext.of(EventName.TURN_END));
         flushHookNotifications();
+        // 后台子 Agent 的结论在这里进对话：下一轮 LLM 就能看到
+        flushTaskNotifications();
 
         if (fullText.isBlank()) {
             return Command.println(Styles.MUTED.render("（本轮没有返回文本内容）"));
@@ -1381,6 +1653,7 @@ public class AgentModel implements Model, UIController {
         fireHook(HookContext.of(EventName.ERROR, message));
         fireHook(HookContext.of(EventName.TURN_END));
         flushHookNotifications();
+        flushTaskNotifications();
         return Command.println(Styles.ERROR.render("✗ " + message));
     }
 
@@ -1392,6 +1665,31 @@ public class AgentModel implements Model, UIController {
                 PromptBuilder.detectEnvironment(cfg.getModel()), null);
         this.contextWindow = cfg.getContextWindow();
         llmClient = LlmClient.create(cfg, systemPrompt);
+        // 子 Agent 要用同一套客户端配置；模型别名（haiku 之类）由 modelResolver 按需另建
+        if (agentTool != null) {
+            agentTool.setClient(llmClient);
+            agentTool.setProtocol(activeProvider.normalizedProtocol());
+            agentTool.setBaseSystemPrompt(systemPrompt);
+            agentTool.setModelResolver(this::clientForSubAgent);
+        }
+    }
+
+    /**
+     * 子 Agent 指定模型时临时另建一个客户端：复制一份 provider 配置改 model，
+     * 不去动原配置（{@code ProviderConfig} 是可变的，复制最省事也最安全）。
+     */
+    private LlmClient clientForSubAgent(String model) {
+        if (model == null || model.isBlank() || activeProvider == null) {
+            return llmClient;
+        }
+        if (model.equals(activeProvider.getModel())) {
+            return llmClient;
+        }
+        var cfg = new ProviderConfig(activeProvider.getName(), activeProvider.getProtocol(),
+                activeProvider.getBaseUrl(), activeProvider.getApiKey(), model,
+                activeProvider.isThinking());
+        cfg.setContextWindow(activeProvider.getContextWindow());
+        return LlmClient.create(cfg, systemPrompt);
     }
 
     // ───────────────────────── 会话持久化 ─────────────────────────
