@@ -1,7 +1,10 @@
 package com.agentjava.conversation;
 
 import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 
 import com.agentjava.conversation.ToolResultBlock;
 import com.agentjava.conversation.ToolUseBlock;
@@ -126,6 +129,92 @@ public class ConversationManager {
         for (Message m : other.getMessages()) {
             messages.add(m.copy());
         }
+    }
+
+    /** 工具结果丢失时补位用的占位正文；模型看到就知道这步没跑成，而不是"工具返回了空"。 */
+    public static final String TOOL_RESULT_LOST_MESSAGE =
+            "[error] tool result lost: the session was interrupted before this tool completed";
+
+    /**
+     * 修复工具调用链的完整性，返回修复条数。
+     *
+     * <p>为什么要这层补丁：会话是从磁盘恢复出来的，而磁盘上的记录可能不全——进程在模型
+     * 发起 tool_use 之后、工具返回之前被杀掉，恢复出来的历史里就有一次没有结果的调用。
+     * 直接把这种历史发给 Anthropic 会被拒绝（tool_use 必须紧跟配对的 tool_result），
+     * 而且这类报错是在第一次请求时才炸，很难定位到「其实是上次的会话文件少了一行」。
+     *
+     * <p>两个方向的修复，配对凭据是 {@code toolUseId}：
+     * <ol>
+     *   <li><b>孤儿 tool_result</b>：没有对应 tool_use 的结果块，直接丢弃。留着会让协议层
+     *       找不到它指的哪次调用，同样是报错。</li>
+     *   <li><b>悬空 tool_use</b>：发起了调用却没有结果，补一条内容为错误的 tool_result，
+     *       而不是把这次调用删掉。删调用会让模型以为自己从没要过这个文件，
+     *       补错误结果则是明确告诉它「这一步没跑成」。</li>
+     * </ol>
+     *
+     * <p><b>刻意不回写磁盘</b>：这是发请求前的运行时修补，不是数据修复。存档保持原样，
+     * 每次加载都重新修一遍，避免把一次性的运行时判断固化进持久数据。
+     */
+    public int fixToolCallChain() {
+        Set<String> requested = new LinkedHashSet<>();
+        Set<String> answered = new HashSet<>();
+        for (Message m : messages) {
+            if (m.getToolUses() != null) {
+                for (ToolUseBlock tu : m.getToolUses()) {
+                    requested.add(tu.toolUseId());
+                }
+            }
+            if (m.getToolResults() != null) {
+                for (ToolResultBlock tr : m.getToolResults()) {
+                    answered.add(tr.toolUseId());
+                }
+            }
+        }
+        int fixed = 0;
+
+        // 1) 孤儿 tool_result：没有任何 tool_use 与之配对 → 丢弃
+        Set<String> orphan = new HashSet<>(answered);
+        orphan.removeAll(requested);
+        if (!orphan.isEmpty()) {
+            for (Message m : messages) {
+                if (m.getToolResults() == null || m.getToolResults().isEmpty()) {
+                    continue;
+                }
+                List<ToolResultBlock> kept = m.getToolResults().stream()
+                        .filter(tr -> !orphan.contains(tr.toolUseId()))
+                        .toList();
+                if (kept.size() != m.getToolResults().size()) {
+                    fixed += m.getToolResults().size() - kept.size();
+                    m.setToolResults(kept.isEmpty() ? null : new ArrayList<>(kept));
+                }
+            }
+        }
+
+        // 2) 悬空 tool_use：没有任何 tool_result 与之配对 → 补一条错误结果
+        List<String> dangling = requested.stream()
+                .filter(id -> !answered.contains(id))
+                .toList();
+        if (!dangling.isEmpty()) {
+            List<ToolResultBlock> blocks = new ArrayList<>(dangling.size());
+            for (String id : dangling) {
+                blocks.add(new ToolResultBlock(id, TOOL_RESULT_LOST_MESSAGE, true));
+            }
+            // 补位块要挂在 user 名下。若末尾已经是 user 消息就并入其中，
+            // 否则新建——连续两条 user 消息会破坏 API 的严格交替要求
+            Message last = messages.isEmpty() ? null : messages.get(messages.size() - 1);
+            if (last != null && last.getRole() == Message.Role.USER) {
+                List<ToolResultBlock> merged = new ArrayList<>();
+                if (last.getToolResults() != null) {
+                    merged.addAll(last.getToolResults());
+                }
+                merged.addAll(blocks);
+                last.setToolResults(merged);
+            } else {
+                addToolResultsMessage(blocks);
+            }
+            fixed += dangling.size();
+        }
+        return fixed;
     }
 
     // ───────────────────────── Token 用量锚点（Layer 2） ─────────────────────────

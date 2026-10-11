@@ -6,13 +6,19 @@ import com.agentjava.compact.ContextCompactor;
 import com.agentjava.compact.RecoveryState;
 import com.agentjava.config.ProviderConfig;
 import com.agentjava.conversation.ConversationManager;
+import com.agentjava.history.HistoryStore;
 import com.agentjava.llm.LlmClient;
 import com.agentjava.mcp.McpManager;
 import com.agentjava.mcp.McpServerConfig;
+import com.agentjava.memory.MemoryConsolidator;
+import com.agentjava.memory.MemoryManager;
 import com.agentjava.permission.PermissionMode;
 import com.agentjava.permission.PermissionResponse;
 import com.agentjava.prompt.PlanModePrompt;
 import com.agentjava.prompt.PromptBuilder;
+import com.agentjava.session.SessionInfo;
+import com.agentjava.session.SessionManager;
+import com.agentjava.session.SessionMessage;
 import com.agentjava.tool.ToolRegistry;
 import com.agentjava.tui.tea.Ansi;
 import com.agentjava.tui.tea.Command;
@@ -23,11 +29,13 @@ import com.agentjava.tui.tea.Program;
 import com.agentjava.tui.tea.UpdateResult;
 import com.agentjava.tui.tea.WindowSizeMessage;
 
+import java.time.Instant;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.UUID;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
 
@@ -81,8 +89,12 @@ public class AgentModel implements Model {
     /** 当前待决的权限请求 future；用户按键后由 UI 回传 PermissionResponse。 */
     private CompletableFuture<PermissionResponse> pendingPermission;
 
-    /** 会话 ID：隔离各会话的工具结果溢写目录。 */
-    private final String sessionId = UUID.randomUUID().toString();
+    /**
+     * 会话 ID：格式 {@code YYYYMMDD-HHMMSS-xxxx}。
+     * 既是会话存档的文件名，也是工具结果溢写目录的隔离键——两者一致，
+     * 恢复历史会话后才能接着读当时的溢写文件。
+     */
+    private String sessionId = SessionManager.newId();
 
     /** 上下文窗口（token）：从 provider 配置读取，驱动压缩阈值。 */
     private int contextWindow = 200_000;
@@ -96,6 +108,21 @@ public class AgentModel implements Model {
 
     /** 本轮是否因错误收场，用于在 LoopComplete 时避免重复落地。 */
     private boolean agentErrored = false;
+
+    /** 跨会话记忆：项目指令发现 + 自动记忆双目录。 */
+    private final MemoryManager memory;
+
+    /** 记忆治理器：门控通过后 fork 子 Agent 合并/清理旧记忆。 */
+    private final MemoryConsolidator consolidator;
+
+    /** 输入历史（存在 ~/.agentjava/prompt_history.jsonl，跟人走不跟项目走）。 */
+    private final HistoryStore history = new HistoryStore();
+
+    /**
+     * 已落盘到会话存档的消息条数。
+     * 每次追加只写 {@code [persistedCount, size)} 这一段增量，避免重复写整份历史。
+     */
+    private int persistedCount = 0;
 
     /** 输入缓冲：Alt+Enter / Ctrl+J 插入换行，Enter 提交。 */
     private final StringBuilder input = new StringBuilder();
@@ -123,6 +150,9 @@ public class AgentModel implements Model {
     public AgentModel(List<ProviderConfig> providers, String workingDir, List<McpServerConfig> mcpConfigs) {
         this.providers = List.copyOf(providers);
         this.workingDir = workingDir == null ? System.getProperty("user.dir") : workingDir;
+        // 跨会话记忆：构造即确保双目录存在（用户级 ~/.agentjava/memory 与项目级 .agentjava/memory）
+        this.memory = new MemoryManager(this.workingDir);
+        this.consolidator = MemoryConsolidator.forMemoryManager(this.memory, this.workingDir);
         // 先用环境探测（此时 provider 未激活，model 未知）构建一次七模块 System Prompt；
         // 激活 provider 拿到 model 后会用真实 model 重建，让 Environment 段落带上模型名。
         this.systemPrompt = PromptBuilder.buildSystemPrompt(
@@ -153,6 +183,28 @@ public class AgentModel implements Model {
         } else {
             this.state = AppState.PROVIDER_SELECT;
         }
+        // 记忆装配放在最后：它要往对话里注入内容，得等 provider 选择分支确定之后再做，
+        // 保证无论走哪条路径都注入一次
+        bootstrapMemory();
+    }
+
+    /**
+     * 新会话启动时的记忆装配。
+     *
+     * <p>顺序有讲究：自动记忆索引必须先注入，因为 {@link MemoryManager#injectMemories}
+     * 只在对话为空时才动作（它要补一条助手确认来凑成合法的 user/assistant 交替）。
+     * 项目指令走 system-reminder 追加在后，不占这个「空」的位置。
+     *
+     * <p>注入的内容刻意<b>不进会话存档</b>：它们每次启动都会重新装配，
+     * 存进 JSONL 只会让历史越滚越脏。{@code persistedCount} 直接跳过这一段。
+     */
+    private void bootstrapMemory() {
+        memory.injectMemories(conversation);
+        String instructions = memory.loadInstructions();
+        if (!instructions.isBlank()) {
+            conversation.addSystemReminder(instructions);
+        }
+        persistedCount = conversation.size();
     }
 
     /** Program 建好之后回灌进来，Agent 的事件要靠它投回事件循环。 */
@@ -271,6 +323,8 @@ public class AgentModel implements Model {
                     registry.getAllSchemas(activeProvider.normalizedProtocol());
             ContextCompactor.forceCompact(
                     conversation, llmClient, contextWindow, workingDir, sessionId, recovery, schemas);
+            // 压缩要把 marker 落到会话存档里，否则下次恢复只能全量回放被压缩掉的历史
+            writeCompactBoundary();
             int after = ContextCompactor.estimateTokens(conversation.getMessages());
             return Command.println(Styles.ACCENT.render(
                     "✻ 手动压缩完成: " + before + " → " + after + " estimated tokens"));
@@ -296,10 +350,25 @@ public class AgentModel implements Model {
                     PlanModePrompt.buildExitReminder(planPath, PlanModePrompt.planExists(planPath)));
             return Command.println(Styles.ACCENT.render("✻ 已退出 Plan Mode，恢复正常工作模式"));
         }
+        // 记忆与会话管理 
+        if ("/memory".equals(trimmed)) {
+            return handleMemoryCommand();
+        }
+        if (trimmed.equals("/session") || trimmed.startsWith("/session ")) {
+            return handleSessionCommand(trimmed.substring("/session".length()).trim());
+        }
+        if (trimmed.equals("/resume") || trimmed.startsWith("/resume ")) {
+            return handleResumeCommand(trimmed.substring("/resume".length()).trim());
+        }
 
         // 用户输入先写进 scrollback，再进历史：即使请求失败也能看到自己问了什么
         Command echo = Command.println(Styles.PROMPT.render("❯ ") + Styles.USER.render(text));
         conversation.addUserMessage(text);
+        history.append(text);
+        // 发请求前统一兜一层：修复可能残缺的工具调用链。
+        // 会话恢复只是它要兜住的来路之一，所以要放在每轮提交时而不是只在 /resume 里。
+        conversation.fixToolCallChain();
+        flushSession();
 
         if (llmClient == null) {
             return Command.batch(echo, Command.println(Styles.ERROR.render("✗ 还没有可用的 provider。")));
@@ -400,6 +469,9 @@ public class AgentModel implements Model {
     }
 
     private Command handleAgentEvent(AgentEvent event) {
+        // 每个事件进来先落一次盘：Agent 是在它自己的虚拟线程里往 conversation 追加消息的，
+        // 这里做 diff 增量写，崩溃时最多丢最后一条，而不是丢整个 Turn。
+        flushSession();
         return switch (event) {
             // 正文增量进缓冲区，界面立刻就能看到
             case AgentEvent.StreamText st -> {
@@ -420,8 +492,12 @@ public class AgentModel implements Model {
                 yield Command.none();
             }
             case AgentEvent.TurnComplete tc -> Command.none();
-            case AgentEvent.CompactingEvent ce -> Command.println(Styles.ACCENT.render(
-                    "✻ 压缩上下文: " + ce.beforeTokens() + " → " + ce.afterTokens() + " estimated tokens"));
+            case AgentEvent.CompactingEvent ce -> {
+                // 压缩留下了 marker：摘要 + 保留的尾部原文，供下次恢复做压缩感知重建
+                writeCompactBoundary();
+                yield Command.println(Styles.ACCENT.render(
+                        "✻ 压缩上下文: " + ce.beforeTokens() + " → " + ce.afterTokens() + " estimated tokens"));
+            }
             case AgentEvent.RetryEvent re ->
                     Command.println(Styles.MUTED.render("↻ " + re.reason()));
             // 权限请求：Agent Loop 已经阻塞在 future 上，这里弹出确认窗，等用户拍板
@@ -432,8 +508,12 @@ public class AgentModel implements Model {
                         Styles.ACCENT.render("⚠ 权限请求: " + pre.description())
                                 + Styles.MUTED.render("\n  (y) 允许 / (a) 始终允许 / (n) 拒绝"));
             }
-            // 整个循环结束：缓冲区落成最终回复
-            case AgentEvent.LoopComplete lc -> finishTurn(streamBuf.toString());
+            // 整个循环结束：先触发记忆系统（提取 / 治理），再把缓冲区落成最终回复
+            case AgentEvent.LoopComplete lc -> {
+                triggerMemoryExtraction();
+                triggerMemoryConsolidation();
+                yield finishTurn(streamBuf.toString());
+            }
             // 出错：展示错误，程序不退出
             case AgentEvent.ErrorEvent ee -> failTurn(ee.message());
         };
@@ -483,6 +563,243 @@ public class AgentModel implements Model {
                 PromptBuilder.detectEnvironment(cfg.getModel()), null);
         this.contextWindow = cfg.getContextWindow();
         llmClient = LlmClient.create(cfg, systemPrompt);
+    }
+
+    // ───────────────────────── 会话持久化 ─────────────────────────
+
+    /**
+     * 把尚未落盘的对话增量追加到会话存档。
+     *
+     * <p>每条消息一次追加写：O(1)，且写到一半崩溃最多坏掉最后一行，
+     * 前面的历史仍然能被完整解析出来。
+     *
+     * <p>指针可能越过 size——那是压缩重构了对话（历史变短）。
+     * 这时以压缩边界为准推进指针即可，边界本身已经记下了压缩前的全部语义。
+     */
+    private void flushSession() {
+        var messages = conversation.getMessages();
+        if (persistedCount > messages.size()) {
+            persistedCount = messages.size();
+            return;
+        }
+        for (int i = persistedCount; i < messages.size(); i++) {
+            SessionManager.saveConversationMessage(workingDir, sessionId, messages.get(i));
+        }
+        persistedCount = messages.size();
+    }
+
+    /**
+     * 压缩发生后写一条边界记录。
+     *
+     * <p>压缩后的对话形如「一条摘要 user + 保留的尾部原文」——这是 Ch8 重建的定式，
+     * 所以这里不必回头问压缩器要数据，直接从当前对话推出来就行：
+     * 第 0 条是摘要，其余是尾巴。
+     */
+    private void writeCompactBoundary() {
+        var messages = conversation.getMessages();
+        if (messages.isEmpty()) {
+            return;
+        }
+        String summary = messages.get(0).getContent();
+        var keep = SessionManager.keepMessagesFrom(messages.subList(1, messages.size()));
+        SessionManager.saveCompactBoundary(workingDir, sessionId, summary, keep);
+        persistedCount = messages.size();
+    }
+
+    // ───────────────────────── 自动记忆 ─────────────────────────
+
+    /**
+     * 每轮 Loop 结束时甩一个虚拟线程去提取记忆。
+     *
+     * <p>{@code MemoryManager.extract} 本身是同步阻塞的，异步在这里解决——
+     * 提取绝大部分时间是在等网络返回，占着一个平台线程纯属浪费。
+     * 发出去就不再跟踪，没做「上一轮还在跑就补一轮」这类合并调度。
+     */
+    private void triggerMemoryExtraction() {
+        if (llmClient == null || conversation.getMessages().isEmpty()) {
+            return;
+        }
+        final var client = llmClient;
+        final var conv = conversation;
+        Thread.startVirtualThread(() -> {
+            try {
+                if (memory.shouldExtract()) {
+                    memory.extract(client, conv);
+                }
+            } catch (Exception e) {
+                // 提取跑在后台，失败不能冒泡到界面
+            }
+        });
+    }
+
+    /**
+     * 治理与提取挂在同一个位置（Loop 完成时），但两者节奏完全不同：
+     * 提取每轮都跑，治理每轮都调但内部门控会拦住绝大多数调用——
+     * 只有攒够 24 小时和 5 个会话后才真正执行一次。
+     */
+    private void triggerMemoryConsolidation() {
+        if (llmClient == null || activeProvider == null) {
+            return;
+        }
+        try {
+            consolidator.maybeRun(llmClient, conversation, activeProvider.normalizedProtocol());
+        } catch (Exception e) {
+            // 低频重量操作，失败静默：下轮还会再试
+        }
+    }
+
+    // ───────────────────────── UI 命令 ─────────────────────────
+
+    /** {@code /memory}：列出双目录的自动记忆。 */
+    private Command handleMemoryCommand() {
+        var all = memory.loadAll();
+        if (all.isEmpty()) {
+            return Command.println(Styles.MUTED.render(
+                    "（还没有任何自动记忆。和用户聊上几句后，Agent 会自动提取值得记住的信息）"));
+        }
+        var lines = new ArrayList<String>();
+        lines.add(Styles.ACCENT.render("Memories (" + all.size() + " entries)"));
+        for (var f : all) {
+            String type = f.type().isBlank() ? "unknown" : f.type();
+            String name = f.name().isBlank() ? f.filename() : f.name();
+            String desc = f.description().isBlank() ? f.filename() : f.description();
+            lines.add("  " + Styles.USER.render("[" + type + "] " + name)
+                    + Styles.MUTED.render(" — " + desc));
+        }
+        lines.add(Styles.MUTED.render("  项目记忆: " + memory.projectMemDir()));
+        lines.add(Styles.MUTED.render("  用户记忆: " + memory.userMemDir()));
+        return Command.println(String.join("\n", lines));
+    }
+
+    /** {@code /session}：列出会话（当前会话打星号）；{@code /session clean} 清理过期存档。 */
+    private Command handleSessionCommand(String arg) {
+        if ("clean".equals(arg)) {
+            int removed = SessionManager.cleanExpiredSessions(workingDir);
+            return Command.println(Styles.ACCENT.render("✻ 已清理过期会话: " + removed + " 个（阈值 "
+                    + SessionManager.EXPIRY_DAYS + " 天）"));
+        }
+        var sessions = SessionManager.listSessions(workingDir);
+        if (sessions.isEmpty()) {
+            return Command.println(Styles.MUTED.render("（还没有历史会话）"));
+        }
+        var lines = new ArrayList<String>();
+        lines.add(Styles.ACCENT.render("Sessions (" + sessions.size() + ")"));
+        for (SessionInfo s : sessions) {
+            String mark = s.id().equals(sessionId)
+                    ? Styles.PROMPT.render("* ") : "  ";
+            String branch = s.gitBranch().isBlank() ? "" : " · " + s.gitBranch();
+            lines.add(mark + Styles.USER.render(s.id()) + Styles.MUTED.render(
+                    "  " + formatInstant(s.modTime()) + " · " + s.messageCount() + " 条"
+                            + " · " + formatBytes(s.fileSize()) + branch));
+            String title = s.firstMessage().isBlank() ? "(no title)" : s.firstMessage();
+            lines.add("     " + Styles.MUTED.render(title));
+        }
+        lines.add(Styles.MUTED.render("  * 当前会话 · 用 /resume <id> 回到指定会话"));
+        return Command.println(String.join("\n", lines));
+    }
+
+    /** {@code /resume [id]}：恢复历史会话；不带参数时列出可选会话。 */
+    private Command handleResumeCommand(String arg) {
+        if (streaming) {
+            return Command.println(Styles.ERROR.render("✗ 正在回复中，请等本轮结束再切换会话"));
+        }
+        var sessions = SessionManager.listSessions(workingDir);
+        if (sessions.isEmpty()) {
+            return Command.println(Styles.MUTED.render("（还没有历史会话）"));
+        }
+        if (arg.isBlank()) {
+            return handleSessionCommand("");
+        }
+        boolean exists = sessions.stream().anyMatch(s -> s.id().equals(arg));
+        if (!exists) {
+            return Command.println(Styles.ERROR.render("✗ 找不到会话: " + arg));
+        }
+        return restoreSession(arg);
+    }
+
+    /**
+     * 恢复会话，四步走。
+     *
+     * <ol>
+     *   <li><b>解析</b>：逐行读 JSONL，坏行静默跳过（{@link SessionManager#loadSession}）；</li>
+     *   <li><b>修链</b>：补悬空 tool_use、丢孤儿 tool_result（对话层 {@code fixToolCallChain}）；</li>
+     *   <li><b>算 token</b>：恢复出来的历史可能早已逼近窗口，超限就先强制压缩一层；</li>
+     *   <li><b>时间断层提示</b>：距上次活动超过 24 小时，插一条 system-reminder 说明 Gap。</li>
+     * </ol>
+     *
+     * <p>恢复后 {@code sessionId} 切到目标会话，后续对话继续往同一个 JSONL 追加，
+     * 工具结果溢写目录也随之切换，这样回读时还能读到当时的溢写文件。
+     */
+    private Command restoreSession(String id) {
+        List<SessionMessage> records = SessionManager.loadSession(workingDir, id);
+        if (records.isEmpty()) {
+            return Command.println(Styles.ERROR.render("✗ 会话为空或全部记录损坏: " + id));
+        }
+        long lastTs = 0;
+        for (SessionMessage m : records) {
+            lastTs = Math.max(lastTs, m.timestamp());
+        }
+
+        var restored = SessionManager.rebuildConversation(records);
+        int fixed = restored.fixToolCallChain();
+
+        // 第三步：token 检查
+        int before = ContextCompactor.estimateTokens(restored.getMessages());
+        int threshold = ContextCompactor.computeCompactThreshold(contextWindow, 0, true);
+        boolean compacted = false;
+        if (before > threshold && llmClient != null && activeProvider != null) {
+            List<Map<String, Object>> schemas =
+                    registry.getAllSchemas(activeProvider.normalizedProtocol());
+            ContextCompactor.forceCompact(
+                    restored, llmClient, contextWindow, workingDir, id, recovery, schemas);
+            compacted = true;
+        }
+
+        // 第四步：时间断层提示
+        long gapMillis = lastTs > 0
+                ? System.currentTimeMillis() - lastTs * 1000 : 0L;
+        if (gapMillis > 86_400_000L) {
+            restored.addSystemReminder(
+                    "Note: this session was resumed after a gap of "
+                            + (gapMillis / 86_400_000L) + " day(s). "
+                            + "Files may have changed since then — verify before relying "
+                            + "on earlier statements about the codebase.");
+        }
+
+        int count = restored.size();
+        conversation.replaceWith(restored);
+        this.sessionId = id;
+        persistedCount = count;
+
+        int after = ContextCompactor.estimateTokens(conversation.getMessages());
+        var lines = new ArrayList<String>();
+        lines.add(Styles.ACCENT.render("✻ 已回到会话 " + id + " · 恢复 " + count + " 条消息"));
+        if (fixed > 0) {
+            lines.add(Styles.MUTED.render("  修复了 " + fixed + " 处不完整的工具调用"));
+        }
+        if (compacted) {
+            lines.add(Styles.MUTED.render("  历史超过阈值已压缩: " + before + " → " + after
+                    + " estimated tokens"));
+        }
+        return Command.println(String.join("\n", lines));
+    }
+
+    private static String formatInstant(Instant instant) {
+        if (instant == null || Instant.EPOCH.equals(instant)) {
+            return "-";
+        }
+        return DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")
+                .withZone(ZoneId.systemDefault()).format(instant);
+    }
+
+    private static String formatBytes(long bytes) {
+        if (bytes < 1024) {
+            return bytes + "B";
+        }
+        if (bytes < 1024 * 1024) {
+            return "%.1fKB".formatted(Locale.ROOT, bytes / 1024.0);
+        }
+        return "%.1fMB".formatted(Locale.ROOT, bytes / (1024.0 * 1024.0));
     }
 
     // ───────────────────────── 渲染 ─────────────────────────
@@ -602,7 +919,8 @@ public class AgentModel implements Model {
     /** 启动后的一行就绪提示。 */
     private String renderReadyLine() {
         return Styles.ACCENT.render("✻ 已就绪")
-                + Styles.MUTED.render(" · " + EXIT_COMMAND + " 退出 · /mode 切换权限模式 · /plan 进入计划模式 · /do 退出");
+                + Styles.MUTED.render(" · " + EXIT_COMMAND + " 退出 · /memory 记忆 · /session 会话 · /resume 回溯")
+                + Styles.MUTED.render("\n  /mode 权限模式 · /plan 计划模式 · /compact 压缩上下文");
     }
 
     private String separator() {
