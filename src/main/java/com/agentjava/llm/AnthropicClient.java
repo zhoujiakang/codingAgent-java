@@ -141,6 +141,8 @@ public class AnthropicClient implements LlmClient {
 
         int inputTokens = 0;
         int outputTokens = 0;
+        int cacheReadTokens = 0;
+        int cacheCreationTokens = 0;
         String stopReason = "end_turn";
 
         // 流式解析 tool_use：跨多个 delta 累积的 JSON 碎片
@@ -194,7 +196,15 @@ public class AnthropicClient implements LlmClient {
                         jsonAccum.setLength(0);
                     }
                 } else if (event.isMessageStart()) {
-                    inputTokens = (int) event.asMessageStart().message().usage().inputTokens();
+                    var usage = event.asMessageStart().message().usage();
+                    inputTokens = (int) usage.inputTokens();
+                    // 缓存命中/写入的 token 计入基线，让锚定更接近真实用量
+                    if (usage.cacheReadInputTokens().isPresent()) {
+                        cacheReadTokens = usage.cacheReadInputTokens().get().intValue();
+                    }
+                    if (usage.cacheCreationInputTokens().isPresent()) {
+                        cacheCreationTokens = usage.cacheCreationInputTokens().get().intValue();
+                    }
                 } else if (event.isMessageDelta()) {
                     var delta = event.asMessageDelta().delta();
                     if (delta.stopReason().isPresent()) {
@@ -205,7 +215,8 @@ public class AnthropicClient implements LlmClient {
             }
         }
 
-        offer(queue, new StreamEvent.StreamEnd(stopReason, inputTokens, outputTokens));
+        offer(queue, new StreamEvent.StreamEnd(stopReason, inputTokens, outputTokens,
+                cacheReadTokens, cacheCreationTokens));
     }
 
     /** 把内部消息转成 Anthropic 的消息参数，支持文本、tool_use、tool_result 三种块。 */
@@ -264,7 +275,33 @@ public class AnthropicClient implements LlmClient {
                 }
             }
         }
-        return result;
+        // 合并连续的同角色纯文本消息（Anthropic 要求严格交替；Plan Mode 每轮注入的
+        // system-reminder 也是 user 消息，会和真实用户消息相邻，这里把它们并成一条）。
+        return mergeConsecutiveSameRole(result);
+    }
+
+    /**
+     * 合并连续的同角色纯文本消息。合并条件是两边内容都是纯字符串（不是 block 参数列表）；
+     * 只要有一边是 block 类型（如 tool_result），不合并，直接追加，避免破坏工具调用配对。
+     */
+    private static List<MessageParam> mergeConsecutiveSameRole(List<MessageParam> params) {
+        List<MessageParam> merged = new ArrayList<>();
+        for (MessageParam curr : params) {
+            if (merged.isEmpty()) {
+                merged.add(curr);
+                continue;
+            }
+            MessageParam prev = merged.get(merged.size() - 1);
+            if (prev.role().equals(curr.role())
+                    && prev.content().isString() && curr.content().isString()) {
+                String combined = prev.content().asString() + "\n\n" + curr.content().asString();
+                merged.set(merged.size() - 1,
+                        MessageParam.builder().role(prev.role()).content(combined).build());
+            } else {
+                merged.add(curr);
+            }
+        }
+        return merged;
     }
 
     /** 把一个工具 schema（{name, description, input_schema}）转成 Anthropic 的 Tool 对象。 */

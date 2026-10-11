@@ -121,6 +121,7 @@ public final class ConfigLoader {
         cfg.setApiKey(str(m.get("api_key")));
         cfg.setModel(str(m.get("model")));
         cfg.setThinking(bool(m.get("thinking")));
+        cfg.setContextWindow(intVal(m.get("context_window"), 200_000));
 
         // 逐项校验必要项，缺哪一项就点名哪一项
         require(index, "name", cfg.getName());
@@ -163,6 +164,21 @@ public final class ConfigLoader {
             return b;
         }
         return Boolean.parseBoolean(String.valueOf(value).trim());
+    }
+
+    /** 把 YAML 里的标量安全地转成 int；null、空白或非法值一律回退到默认值。 */
+    private static int intVal(Object value, int def) {
+        if (value == null) {
+            return def;
+        }
+        if (value instanceof Number n) {
+            return n.intValue();
+        }
+        try {
+            return Integer.parseInt(String.valueOf(value).trim());
+        } catch (Exception e) {
+            return def;
+        }
     }
 
     /**

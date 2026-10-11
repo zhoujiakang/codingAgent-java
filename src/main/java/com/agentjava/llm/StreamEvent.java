@@ -25,7 +25,8 @@ public sealed interface StreamEvent {
     }
 
     /** 本轮响应结束，带上停止原因与 token 用量。 */
-    record StreamEnd(String stopReason, int inputTokens, int outputTokens) implements StreamEvent {
+    record StreamEnd(String stopReason, int inputTokens, int outputTokens,
+                    int cacheReadTokens, int cacheCreationTokens) implements StreamEvent {
     }
 
     /** 模型开始调用一个工具（拿到工具 id 与名称）。 */

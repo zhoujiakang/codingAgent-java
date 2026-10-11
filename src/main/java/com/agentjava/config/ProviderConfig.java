@@ -26,6 +26,9 @@ public class ProviderConfig {
     /** 是否启用扩展思考；仅 anthropic 协议生效。 */
     private boolean thinking;
 
+    /** 上下文窗口大小（token）。压缩阈值据此计算，默认 200000（Claude 的窗口量级）。 */
+    private int contextWindow = 200_000;
+
     public ProviderConfig() {
     }
 
@@ -84,6 +87,16 @@ public class ProviderConfig {
 
     public void setThinking(boolean thinking) {
         this.thinking = thinking;
+    }
+
+    public int getContextWindow() {
+        return contextWindow;
+    }
+
+    public void setContextWindow(int contextWindow) {
+        if (contextWindow > 0) {
+            this.contextWindow = contextWindow;
+        }
     }
 
     /** 去掉首尾空白后的协议名，便于做不区分大小写的比较。 */

@@ -184,7 +184,7 @@ public class OpenAiClient implements LlmClient {
                     acc.id == null ? "" : acc.id, acc.name == null ? "" : acc.name, args));
         }
 
-        offer(queue, new StreamEvent.StreamEnd("stop", inputTokens, outputTokens));
+        offer(queue, new StreamEvent.StreamEnd("stop", inputTokens, outputTokens, 0, 0));
     }
 
     /**

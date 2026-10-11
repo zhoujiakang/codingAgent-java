@@ -43,6 +43,10 @@ public sealed interface AgentEvent {
     record ErrorEvent(String message) implements AgentEvent {
     }
 
+    /** 上下文压缩发生：报告压缩前后的估算 token 数，UI 用来提示「记忆被重新打包了」。 */
+    record CompactingEvent(int beforeTokens, int afterTokens) implements AgentEvent {
+    }
+
     /** 需要等待后重试（例如限流），UI 可以提示用户。 */
     record RetryEvent(String reason, long waitMs) implements AgentEvent {
     }

@@ -125,6 +125,23 @@ public final class Message {
     }
 
     /**
+     * 深拷贝：复制角色、内容、状态、token 用量与工具块引用。
+     * 压缩重建对话时用——保留原始语义，但作为独立对象脱离原历史列表。
+     */
+    public Message copy() {
+        Message m = new Message(role, content, status);
+        m.inputTokens = this.inputTokens;
+        m.outputTokens = this.outputTokens;
+        if (toolUses != null) {
+            m.setToolUses(new ArrayList<>(toolUses));
+        }
+        if (toolResults != null) {
+            m.setToolResults(new ArrayList<>(toolResults));
+        }
+        return m;
+    }
+
+    /**
      * API 层消息：只有 role 和 content，是要真正发给模型的格式。
      */
     public record ApiMessage(String role, String content) {

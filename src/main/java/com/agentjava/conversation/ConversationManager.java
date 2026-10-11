@@ -22,6 +22,14 @@ public class ConversationManager {
 
     private final List<Message> messages = new ArrayList<>();
 
+    /**
+     * Token 用量锚点（Layer 2 估算用）。
+     * baselineTokens = 上次 API 返回的精确 token 数（input + cacheRead + cacheCreation + output）；
+     * anchorCount = 锚定时刻的消息数量。压缩后失效，清零。
+     */
+    private int baselineTokens = 0;
+    private int anchorCount = 0;
+
     /** 追加一条用户消息。 */
     public Message addUserMessage(String text) {
         Message m = new Message(Message.Role.USER, text, Message.Status.COMPLETE);
@@ -100,6 +108,57 @@ public class ConversationManager {
     /** 清空历史。 */
     public void clear() {
         messages.clear();
+    }
+
+    /** 追加一条已经构造好的消息（压缩重建对话时用）。 */
+    public void addRawMessage(Message m) {
+        if (m != null) {
+            messages.add(m);
+        }
+    }
+
+    /**
+     * 原地替换内部消息列表为另一份对话的内容（深拷贝）。
+     * 压缩重建对话时，用「一条摘要 user + 保留的尾部原文」整体替换旧历史。
+     */
+    public void replaceWith(ConversationManager other) {
+        messages.clear();
+        for (Message m : other.getMessages()) {
+            messages.add(m.copy());
+        }
+    }
+
+    // ───────────────────────── Token 用量锚点（Layer 2） ─────────────────────────
+
+    /**
+     * 锚定本轮真实用量。Agent 在 assistant 消息追加到对话之后调用，传入 API 返回的
+     * input/output/cacheRead/cacheCreation。
+     */
+    public void recordUsageAnchor(int input, int output, int cacheRead, int cacheCreation) {
+        int baseline = input + cacheRead + cacheCreation + output;
+        if (baseline <= 0) {
+            return;
+        }
+        this.baselineTokens = baseline;
+        this.anchorCount = messages.size();
+    }
+
+    public boolean hasUsageAnchor() {
+        return anchorCount > 0;
+    }
+
+    public int getBaselineTokens() {
+        return baselineTokens;
+    }
+
+    public int getAnchorCount() {
+        return anchorCount;
+    }
+
+    /** 清零锚点（压缩后旧消息列表已不存在，或手动/紧急压缩前）。 */
+    public void clearUsageAnchor() {
+        this.baselineTokens = 0;
+        this.anchorCount = 0;
     }
 
     /**

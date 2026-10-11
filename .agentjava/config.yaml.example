@@ -28,6 +28,7 @@ providers:
   #   base_url: https://api.example.com/v1
   #   api_key: "your-api-key-here"
   #   model: model-name
+  #   context_window: 200000   # 可选：上下文窗口大小（token），驱动自动压缩阈值；默认 200000
 
 # 只配一个 provider 时，启动直接进入对话；
 # 配了多个，启动后先用方向键选一个（选定后本次会话不再切换）。

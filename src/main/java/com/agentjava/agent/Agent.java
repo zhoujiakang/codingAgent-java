@@ -2,7 +2,10 @@ package com.agentjava.agent;
 
 import com.agentjava.conversation.ConversationManager;
 import com.agentjava.conversation.ToolResultBlock;
+import com.agentjava.conversation.ToolResultBudget;
 import com.agentjava.conversation.ToolUseBlock;
+import com.agentjava.compact.ContextCompactor;
+import com.agentjava.compact.RecoveryState;
 import com.agentjava.llm.LlmClient;
 import com.agentjava.llm.StreamEvent;
 import com.agentjava.permission.PermissionChecker;
@@ -13,10 +16,11 @@ import com.agentjava.tool.ToolCategory;
 import com.agentjava.tool.ToolRegistry;
 
 import java.nio.file.Path;
-
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
@@ -50,6 +54,22 @@ public class Agent {
 
     /** 权限检查器；工作目录就绪后构建，权限模式变化时同步更新。 */
     private PermissionChecker checker;
+
+    /** 上下文窗口大小（token），压缩阈值据此计算。 */
+    private int contextWindow = 200_000;
+
+    /** 会话 ID，用于隔离各会话的工具结果溢写目录。 */
+    private String sessionId = "default";
+
+    /** 最近访问的文件 / 激活的 Skill 记录，压缩后的恢复块从这里取。跨轮次累积。 */
+    private RecoveryState recovery = new RecoveryState();
+
+    /** 自动压缩熔断器：连续 3 次摘要失败则熔断，停止自动触发。 */
+    private ContextCompactor.AutoCompactTrackingState breaker =
+            new ContextCompactor.AutoCompactTrackingState();
+
+    /** 紧急压缩重试计数：API 返回上下文超长时最多重试 3 次。 */
+    private int contextRetries = 0;
 
     public Agent(LlmClient client, ToolRegistry registry, String protocol, String baseSystemPrompt) {
         this.client = client;
@@ -87,6 +107,34 @@ public class Agent {
         this.workDir = workDir;
         this.checker = new PermissionChecker(permissionMode,
                 workDir != null ? Path.of(workDir) : null);
+    }
+
+    /** 设置上下文窗口大小（token）。 */
+    public void setContextWindow(int contextWindow) {
+        if (contextWindow > 0) {
+            this.contextWindow = contextWindow;
+        }
+    }
+
+    /** 设置会话 ID，用于隔离各会话的工具结果溢写目录。 */
+    public void setSessionId(String sessionId) {
+        if (sessionId != null && !sessionId.isBlank()) {
+            this.sessionId = sessionId;
+        }
+    }
+
+    /** 注入跨轮次累积的恢复状态（最近访问的文件 / 激活的 Skill）。 */
+    public void setRecovery(RecoveryState recovery) {
+        if (recovery != null) {
+            this.recovery = recovery;
+        }
+    }
+
+    /** 注入自动压缩熔断器（跨轮次累积）。 */
+    public void setBreaker(ContextCompactor.AutoCompactTrackingState breaker) {
+        if (breaker != null) {
+            this.breaker = breaker;
+        }
     }
 
     /**
@@ -140,6 +188,19 @@ public class Agent {
                     conv.addSystemReminder(PlanModePrompt.buildReminder(planPath, exists, iteration));
                 }
 
+                // 每轮调 API 前：检查是否需要自动压缩（软硬双阈值 + 熔断）。
+                // 压缩前先算一次 token，压缩后再算一次，用差值提示 UI「记忆被重新打包了」。
+                int preTokens = ContextCompactor.currentTokens(conv.getMessages(),
+                        conv.hasUsageAnchor()
+                                ? new ContextCompactor.UsageAnchor(conv.getBaselineTokens(), conv.getAnchorCount())
+                                : null);
+                String compactSummary = ContextCompactor.autoCompact(
+                        conv, client, contextWindow, workDir, sessionId, recovery, schemas, breaker);
+                if (!compactSummary.isEmpty()) {
+                    int postTokens = ContextCompactor.currentTokens(conv.getMessages(), null);
+                    putSafe(queue, new AgentEvent.CompactingEvent(preTokens, postTokens));
+                }
+
                 // 调 LLM，拿事件队列
                 var streamQueue = client.stream(conv, schemas);
 
@@ -148,6 +209,7 @@ public class Agent {
                 var toolCalls = new ArrayList<ToolCallInfo>();
                 String stopReason = "end_turn";
                 int turnInput = 0, turnOutput = 0;
+                int turnCacheRead = 0, turnCacheCreation = 0;
                 boolean streamError = false;
                 String lastError = null;
 
@@ -189,6 +251,8 @@ public class Agent {
                             stopReason = se.stopReason();
                             turnInput = se.inputTokens();
                             turnOutput = se.outputTokens();
+                            turnCacheRead = se.cacheReadTokens();
+                            turnCacheCreation = se.cacheCreationTokens();
                         }
                         case StreamEvent.Error err -> {
                             streamError = true;
@@ -202,8 +266,15 @@ public class Agent {
                     }
                 }
 
-                // 流出错：记录到历史并停止循环
+                // 流出错：若是上下文超长，紧急压缩后重试本轮请求（不把错误写进历史）
                 if (streamError) {
+                    if (isContextTooLong(lastError) && contextRetries < 3) {
+                        contextRetries++;
+                        ContextCompactor.forceCompact(
+                                conv, client, contextWindow, workDir, sessionId, recovery, schemas);
+                        conv.clearUsageAnchor();
+                        continue;
+                    }
                     if (lastError != null) {
                         conv.addErrorMessage(lastError);
                     }
@@ -216,11 +287,12 @@ public class Agent {
                 totalOutput += turnOutput;
                 putSafe(queue, new AgentEvent.UsageEvent(totalInput, totalOutput));
 
-                // 保存本轮助手消息（正文 + 工具调用块）
+                // 保存本轮助手消息（正文 + 工具调用块），并锚定本轮真实用量
                 var toolUseBlocks = toolCalls.stream()
                         .map(tc -> new ToolUseBlock(tc.toolId(), tc.toolName(), tc.args()))
                         .toList();
                 conv.addAssistantMessageWithTools(text.toString(), toolUseBlocks);
+                conv.recordUsageAnchor(turnInput, turnOutput, turnCacheRead, turnCacheCreation);
 
                 // 停止条件三：模型不再调用工具 → 任务完成
                 if (toolCalls.isEmpty()) {
@@ -236,11 +308,39 @@ public class Agent {
                         .toList();
                 var results = executor.executeAll(callInfos);
 
-                // 工具结果回写历史（user 角色，与 tool_use 配对）
-                var resultBlocks = results.stream()
-                        .map(r -> new ToolResultBlock(r.toolId(), r.output(), r.isError()))
-                        .toList();
-                conv.addToolResultsMessage(resultBlocks);
+                // ── Layer 1：工具结果预算（入历史前完成，写入即终态）──
+                // 1) 先算豁免集：模型回读之前溢写的文件时，读回内容同样巨大，照常溢写会永远看不到全文
+                Path spillDir = ToolResultBudget.spillDir(workDir, sessionId);
+                Set<String> exemptIds = new HashSet<>();
+                for (var tc : toolCalls) {
+                    if (ToolResultBudget.isSpillReadback(tc.toolName(), tc.args(), spillDir)) {
+                        exemptIds.add(tc.toolId());
+                    }
+                }
+                // 2) 逐条组装，单条超阈值先写盘换预览，溢过即加入豁免集
+                var resultBlocks = new ArrayList<ToolResultBlock>(results.size());
+                for (var r : results) {
+                    String content = r.output();
+                    if (content.length() > ToolRegistry.MAX_OUTPUT_CHARS
+                            && !exemptIds.contains(r.toolId())) {
+                        content = ToolResultBudget.persistLargeResult(spillDir, r.toolId(), r.output());
+                        exemptIds.add(r.toolId());
+                    }
+                    resultBlocks.add(new ToolResultBlock(r.toolId(), content, r.isError()));
+                }
+                // 3) 聚合预算：一轮并行结果合计超 200K 字符时，从最大的非豁免结果开始落盘
+                var budgeted = ToolResultBudget.apply(resultBlocks, spillDir, exemptIds);
+                conv.addToolResultsMessage(budgeted);
+
+                // 记录最近访问的文件，供后续压缩的恢复块使用
+                for (int i = 0; i < toolCalls.size(); i++) {
+                    var tc = toolCalls.get(i);
+                    var r = results.get(i);
+                    if (tc.args() != null && tc.args().get("file_path") instanceof String fp
+                            && Set.of("ReadFile", "EditFile", "WriteFile").contains(tc.toolName())) {
+                        recovery.recordFile(fp, r.output());
+                    }
+                }
 
                 putSafe(queue, new AgentEvent.TurnComplete(iteration));
             }
@@ -253,6 +353,15 @@ public class Agent {
 
     /** 工具调用的本地载体：贯穿"收集 → 执行"两个阶段。 */
     private record ToolCallInfo(String toolId, String toolName, Map<String, Object> args) {
+    }
+
+    /** 判断错误是否由上下文超长引起（紧急压缩的触发条件）。 */
+    private static boolean isContextTooLong(String err) {
+        if (err == null) {
+            return false;
+        }
+        String lower = err.toLowerCase();
+        return lower.contains("context") || lower.contains("too long") || lower.contains("prompt");
     }
 
     private static void putSafe(BlockingQueue<AgentEvent> queue, AgentEvent event) {
