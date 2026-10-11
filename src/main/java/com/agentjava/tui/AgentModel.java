@@ -23,7 +23,11 @@ import com.agentjava.prompt.PlanModePrompt;
 import com.agentjava.prompt.PromptBuilder;
 import com.agentjava.session.SessionManager;
 import com.agentjava.session.SessionMessage;
+import com.agentjava.skill.SkillCatalog;
+import com.agentjava.skill.SkillExecutor;
+import com.agentjava.skill.SkillForkHost;
 import com.agentjava.tool.ToolRegistry;
+import com.agentjava.tool.impl.LoadSkillTool;
 import com.agentjava.tui.tea.Ansi;
 import com.agentjava.tui.tea.Command;
 import com.agentjava.tui.tea.KeyPressMessage;
@@ -33,13 +37,18 @@ import com.agentjava.tui.tea.Program;
 import com.agentjava.tui.tea.UpdateResult;
 import com.agentjava.tui.tea.WindowSizeMessage;
 
+import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
 
 /**
  * 主 TUI 模型。
@@ -58,6 +67,11 @@ import java.util.concurrent.CompletableFuture;
  *   <li><b>命令主机</b>：持有一个 {@link CommandRegistry}，负责「判断输入是不是命令 →
  *       查命令 → 按类型路由 → 把结果渲染成副作用指令」这条链路。</li>
  * </ul>
+ *
+ * <p>它同时还多一个身份：<b>Skill 宿主</b>。它持有 {@link SkillCatalog}、把 Skill
+ * 注册成斜杠命令、实现 {@link SkillForkHost} 给 fork 模式提供隔离子 Agent 运行时。
+ * 之所以落在这一层而不是 {@link Agent} 里，是因为「起一个子 Agent」需要 LLM 客户端
+ * 与 provider，这两样只在 TUI 启动时才确定。
  *
  * <p>{@code com.agentjava.tui.tea.Command}（TEA 的副作用指令）与
  * {@code com.agentjava.command.Command}（Slash Command 定义）同名，后面一律用全限定名区分。
@@ -126,6 +140,32 @@ public class AgentModel implements Model, UIController {
 
     /** 跨轮次累积的恢复状态（最近访问的文件 / 激活的 Skill），随会话持久。 */
     private final RecoveryState recovery = new RecoveryState();
+
+    // ─────────────────── Skill 技能包系统 ───────────────────
+
+    /**
+     * Skill 目录：启动时按「内置 → 用户级 → 项目级」三级扫描，只加载 frontmatter。
+     * 正文等 {@code LoadSkill} 或 {@code /<name>} 触发时再读（两阶段加载）。
+     */
+    private SkillCatalog skillCatalog;
+
+    /** Skill 宿主实现：登记激活、给 fork 模式起子 Agent。 */
+    private final SkillHostImpl skillHost = new SkillHostImpl();
+
+    /** 按需加载工具：模型判断意图匹配后调用它取完整 SOP。 */
+    private final LoadSkillTool loadSkillTool = new LoadSkillTool();
+
+    /**
+     * 本会话激活过的 Skill 名（按激活顺序，去重）。
+     * Skill 可能由后台的 Agent 线程经 LoadSkill 激活，所以用并发容器。
+     */
+    private final List<String> activeSkills = new CopyOnWriteArrayList<>();
+
+    /**
+     * 已经通知过模型的 Skill 名。首条 system-reminder 会带上全量清单，
+     * 之后只补增量——重复注入同一段清单只会白烧 token。
+     */
+    private final Set<String> announcedSkills = new LinkedHashSet<>();
 
     /** 自动压缩熔断器，跨轮次累积。 */
     private final ContextCompactor.AutoCompactTrackingState breaker =
@@ -218,6 +258,9 @@ public class AgentModel implements Model, UIController {
         } else {
             this.state = AppState.PROVIDER_SELECT;
         }
+        // Skill 装配要在记忆装配之前：Skill 清单和记忆索引进的是同一条 system-reminder，
+        // 而记忆注入只在「对话为空」时动作，顺序反了会把清单挤到助手消息之后
+        bootstrapSkills();
         // 记忆装配放在最后：它要往对话里注入内容，得等 provider 选择分支确定之后再做，
         // 保证无论走哪条路径都注入一次
         bootstrapMemory();
@@ -228,7 +271,7 @@ public class AgentModel implements Model, UIController {
      *
      * <p>顺序有讲究：自动记忆索引必须先注入，因为 {@link MemoryManager#injectMemories}
      * 只在对话为空时才动作（它要补一条助手确认来凑成合法的 user/assistant 交替）。
-     * 项目指令走 system-reminder 追加在后，不占这个「空」的位置。
+     * 项目指令与 Skill 清单走 system-reminder 追加在后，不占这个「空」的位置。
      *
      * <p>注入的内容刻意<b>不进会话存档</b>：它们每次启动都会重新装配，
      * 存进 JSONL 只会让历史越滚越脏。{@code persistedCount} 直接跳过这一段。
@@ -239,7 +282,312 @@ public class AgentModel implements Model, UIController {
         if (!instructions.isBlank()) {
             conversation.addSystemReminder(instructions);
         }
+        injectSkillSection();
         persistedCount = conversation.size();
+    }
+
+    // ───────────────────────── Skill 装配 ─────────────────────────
+
+    /**
+     * 启动时装配 Skill 系统，四步：
+     * <ol>
+     *   <li>三级扫描目录，只加载 frontmatter（阶段一）；</li>
+     *   <li>把每个 Skill 注册成 {@code /<name>} 斜杠命令；</li>
+     *   <li>注册 {@code LoadSkill} 工具，让模型能按意图按需加载（阶段二）；</li>
+     *   <li>注册 {@code /skill} 管理命令。</li>
+     * </ol>
+     */
+    private void bootstrapSkills() {
+        skillCatalog = SkillCatalog.loadCatalog(workingDir);
+        for (String name : skillCatalog.names()) {
+            registerSkillCommand(name);
+        }
+
+        loadSkillTool.setCatalog(skillCatalog);
+        loadSkillTool.setHost(skillHost);
+        loadSkillTool.setForkHost(skillHost);
+        registry.register(loadSkillTool);
+
+        commands.register(new com.agentjava.command.Command(
+                "skill", "Skill 管理：list / info / reload", new String[]{"skills"},
+                CommandType.LOCAL, "/skill [list|info <名称>|reload]", "", this::handleSkill));
+    }
+
+    /**
+     * 把 Skill 清单（只有 name + description）以 system-reminder 注入对话。
+     *
+     * <p>放在 messages 而不是 System Prompt，是为了不让 System Prompt 跟着项目变——
+     * 它一变，Prompt Cache 的整段前缀就失效了。
+     */
+    private void injectSkillSection() {
+        if (skillCatalog == null) {
+            return;
+        }
+        String section = skillCatalog.buildSection(workingDir);
+        if (section.isBlank()) {
+            return;
+        }
+        conversation.addSystemReminder(section);
+        announcedSkills.addAll(skillCatalog.names());
+    }
+
+    /**
+     * 把一个 Skill 注册成斜杠命令。
+     *
+     * <p><b>内置命令优先</b>：名字撞上已有命令就直接跳过。Skill 是用户自己写的
+     * Markdown，命名冲突随时可能发生；让内置命令赢，才能保证 {@code /help}、
+     * {@code /clear} 这些保底能力永远不会被一个第三方 Skill 顶掉。
+     *
+     * <p>命令类型固定为 {@link CommandType#PROMPT}：返回值不是展示文本，而是要交给
+     * Agent 的提示词，SOP 借此进入对话触发下一轮循环。
+     */
+    private void registerSkillCommand(String name) {
+        if (commands.find(name).isPresent()) {
+            return;
+        }
+        var skill = skillCatalog.get(name);
+        if (skill.isEmpty()) {
+            return;
+        }
+        String captured = name;
+        String description = skill.get().meta().description();
+        commands.register(new com.agentjava.command.Command(
+                captured, description + " [skill]", new String[]{},
+                CommandType.PROMPT, "/" + captured + " [参数]", "",
+                ctx -> runSkill(captured, ctx.args())));
+    }
+
+    /**
+     * 执行一个 Skill：按 SKILL.md 声明的 mode 分流。
+     *
+     * <p>两条触发路径（用户敲 {@code /<name>}、模型调 LoadSkill）都走这里，
+     * 保证「Skill 声明的隔离意图」在两条路上一致生效。
+     *
+     * <p>fork 模式需要 LLM 客户端；provider 还没激活时降级成 inline——
+     * 保留功能比坚持隔离更重要，何况此时也才刚启动，没有上下文需要隔离。
+     */
+    private String runSkill(String name, String args) {
+        var found = skillCatalog.getFull(name);
+        if (found.isEmpty()) {
+            return "[skill error] not found: " + name;
+        }
+        var skill = found.get();
+        String arguments = args == null ? "" : args;
+        if (skill.meta().isFork() && llmClient != null) {
+            try {
+                String result = SkillExecutor.executeFork(skill, arguments, skillHost);
+                addSystemMessage("✻ Skill /" + name + " 已在隔离上下文中执行完毕，结论如下");
+                return result;
+            } catch (RuntimeException e) {
+                return "✗ Skill /" + name + " fork 执行失败：" + e.getMessage();
+            }
+        }
+        return SkillExecutor.executeInline(skill, arguments, skillHost);
+    }
+
+    /**
+     * 每轮提交前检查 Skill 目录有没有增删。
+     *
+     * <p>目录 modtime 变了才 reload：新增/删除会改变目录项，而已有 Skill 的正文改动
+     * 由 {@link SkillCatalog#getFull} 的按需重读兜住，不必整体重建。
+     * 新出现的 Skill 以 system-reminder 增量补进对话，不重建 System Prompt——
+     * 同样是保住 Prompt Cache 的前缀。
+     */
+    private void refreshSkillsIfNeeded() {
+        if (skillCatalog == null || !skillCatalog.needsReload()) {
+            return;
+        }
+        skillCatalog.reload(workingDir);
+        for (String name : skillCatalog.names()) {
+            registerSkillCommand(name);
+        }
+        List<String> fresh = new ArrayList<>();
+        for (String name : skillCatalog.names()) {
+            if (announcedSkills.add(name)) {
+                fresh.add(name);
+            }
+        }
+        if (fresh.isEmpty()) {
+            return;
+        }
+        StringBuilder sb = new StringBuilder("新检测到以下 Skill，可用 /<name> 或 LoadSkill 调用：\n");
+        for (String name : fresh) {
+            String desc = skillCatalog.getFull(name).map(s -> s.meta().description()).orElse("");
+            sb.append("- /").append(name).append("：").append(desc).append('\n');
+        }
+        conversation.addSystemReminder(sb.toString());
+    }
+
+    // ───────────────────────── /skill 管理命令 ─────────────────────────
+
+    /** {@code /skill [list|info <名称>|reload]}。 */
+    private String handleSkill(com.agentjava.command.CommandContext ctx) {
+        if (skillCatalog == null) {
+            return "（Skill 系统未初始化）";
+        }
+        String[] parts = splitOnce(ctx.args());
+        return switch (parts[0]) {
+            case "", "list" -> skillList();
+            case "info" -> skillInfo(parts[1]);
+            case "reload" -> skillReload();
+            default -> "未知子命令：" + parts[0] + "\n用法：/skill [list|info <名称>|reload]";
+        };
+    }
+
+    private String skillList() {
+        var metas = skillCatalog.list();
+        if (metas.isEmpty()) {
+            return "（还没有安装任何 Skill）\n\n把 Skill 放到下面任一目录即可自动加载：\n"
+                    + "  项目级：" + Path.of(workingDir, ".agentjava", "skills") + "\n"
+                    + "  用户级：" + Path.of(System.getProperty("user.home"), ".agentjava", "skills");
+        }
+        StringBuilder sb = new StringBuilder("已加载 Skill（").append(metas.size()).append(" 个）\n\n");
+        for (var meta : metas) {
+            String desc = meta.description() == null ? "" : meta.description();
+            if (desc.length() > 56) {
+                desc = desc.substring(0, 56) + "…";
+            }
+            sb.append("  ").append(pad("/" + meta.name(), 22))
+                    .append(pad(SkillCatalog.sourceLabel(skillCatalog.source(meta.name())), 8))
+                    .append(desc).append('\n');
+        }
+        if (!activeSkills.isEmpty()) {
+            sb.append("\n本会话已激活：").append(String.join("、", activeSkills)).append('\n');
+        }
+        sb.append("\n/skill info <名称> 看详情 · /skill reload 热重载");
+        return sb.toString();
+    }
+
+    private String skillInfo(String rawName) {
+        String name = rawName == null ? "" : rawName.strip();
+        if (name.startsWith("/")) {
+            name = name.substring(1);
+        }
+        if (name.isEmpty()) {
+            return "用法：/skill info <Skill 名称>";
+        }
+        if (skillCatalog.get(name).isEmpty()) {
+            return "✗ 找不到 Skill: " + name + "（/skill list 看全部）";
+        }
+        return skillCatalog.describe(name);
+    }
+
+    private String skillReload() {
+        skillCatalog.reload(workingDir);
+        for (String name : skillCatalog.names()) {
+            registerSkillCommand(name);
+        }
+        announcedSkills.clear();
+        announcedSkills.addAll(skillCatalog.names());
+        return Styles.ACCENT.render("✻ 已重新加载 Skill 目录，共 " + skillCatalog.size() + " 个")
+                + Styles.MUTED.render("（改动后的 SKILL.md 正文在下次调用时生效）");
+    }
+
+    private static String pad(String text, int width) {
+        if (text == null) {
+            text = "";
+        }
+        int w = 0;
+        for (int i = 0; i < text.length(); ) {
+            int cp = text.codePointAt(i);
+            w += cp > 0x2E80 ? 2 : 1;
+            i += Character.charCount(cp);
+        }
+        return text + " ".repeat(Math.max(1, width - w));
+    }
+
+    // ───────────────────────── SkillHost 实现 ─────────────────────────
+
+    /**
+     * Skill 宿主：inline 模式登记激活，fork 模式起一个隔离子 Agent。
+     *
+     * <p>子 Agent 与主循环共用工具注册中心（Skill 也要能读文件、跑命令），
+     * 但对话是全新的：SOP 正文只出现在子对话里，主对话拿到的是它的最终结论。
+     */
+    private final class SkillHostImpl implements SkillForkHost {
+
+        @Override
+        public void activateSkill(String name, String body) {
+            if (!activeSkills.contains(name)) {
+                activeSkills.add(name);
+            }
+            recovery.recordSkill(name, body);
+        }
+
+        @Override
+        public void recordSkillInvocation(String name, String body) {
+            recovery.recordSkill(name, body);
+        }
+
+        @Override
+        public List<com.agentjava.conversation.Message> snapshotParentMessages() {
+            return List.copyOf(conversation.getMessages());
+        }
+
+        @Override
+        public String runSubAgent(String body,
+                                  List<com.agentjava.conversation.Message> seed,
+                                  String model) {
+            if (llmClient == null || activeProvider == null) {
+                throw new IllegalStateException("还没有可用的 provider，无法启动隔离子 Agent");
+            }
+            // 只把纯文本消息带进子对话：工具调用块脱离了原来的 tool_result 配对关系，
+            // 单独搬过去会破坏 user/assistant 交替与 tool_use 配对规则
+            var subConv = new ConversationManager();
+            if (seed != null) {
+                for (var msg : seed) {
+                    if (msg.getRole() == com.agentjava.conversation.Message.Role.USER) {
+                        subConv.addUserMessage(msg.getContent());
+                    } else {
+                        subConv.addAssistantMessage(msg.getContent());
+                    }
+                }
+            }
+            subConv.addUserMessage(body);
+
+            var agent = new Agent(clientForSkill(model), registry,
+                    activeProvider.normalizedProtocol(), systemPrompt);
+            agent.setWorkDir(workingDir);
+            agent.setPermissionMode(permissionMode);
+            agent.setMaxIterations(200);
+
+            var output = new StringBuilder();
+            BlockingQueue<AgentEvent> queue = agent.run(subConv);
+            while (true) {
+                AgentEvent event;
+                try {
+                    event = queue.poll(120, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException("Skill 子 Agent 被中断");
+                }
+                if (event == null) {
+                    throw new IllegalStateException("Skill 子 Agent 等待事件超时");
+                }
+                if (event instanceof AgentEvent.StreamText st) {
+                    output.append(st.text());
+                } else if (event instanceof AgentEvent.ErrorEvent err) {
+                    throw new IllegalStateException("Skill 子 Agent 失败：" + err.message());
+                } else if (event instanceof AgentEvent.LoopComplete) {
+                    return output.toString();
+                }
+            }
+        }
+
+        /**
+         * Skill 声明了 {@code model} 且和当前 provider 不同时，临时换模型建一个客户端。
+         * ProviderConfig 是 mutable 的，复制一份改 model 即可，不必改动原配置。
+         */
+        private LlmClient clientForSkill(String model) {
+            if (model == null || model.isBlank() || model.equals(activeProvider.getModel())) {
+                return llmClient;
+            }
+            var cfg = new ProviderConfig(activeProvider.getName(), activeProvider.getProtocol(),
+                    activeProvider.getBaseUrl(), activeProvider.getApiKey(), model,
+                    activeProvider.isThinking());
+            cfg.setContextWindow(activeProvider.getContextWindow());
+            return LlmClient.create(cfg, systemPrompt);
+        }
     }
 
     /** Program 建好之后回灌进来，Agent 的事件要靠它投回事件循环。 */
@@ -435,14 +783,24 @@ public class AgentModel implements Model, UIController {
         };
     }
 
+    /**
+     * Tab 补全候选。
+     *
+     * <p>Skill 注册进 {@link CommandRegistry} 之后，补全不用为它单独写一套匹配——
+     * 它跟内置命令在同一个候选池里，用户敲 {@code /comm} 就能补全出 {@code /commit}。
+     */
+    List<String> commandCandidates(String raw) {
+        if (raw == null || !raw.startsWith("/") || raw.indexOf(' ') >= 0) {
+            return List.of();
+        }
+        return commands.search(raw);
+    }
+
     /** Tab 补全：输入框以 {@code /} 且不含空格时才生效。 */
     private Command completeCommand() {
         String raw = input.toString();
         // 已经输过参数就不再补全——参数候选（会话 ID 之类）暂未实现
-        if (!raw.startsWith("/") || raw.indexOf(' ') >= 0) {
-            return Command.none();
-        }
-        List<String> candidates = commands.search(raw);
+        List<String> candidates = commandCandidates(raw);
         if (candidates.isEmpty()) {
             return Command.none();
         }
@@ -499,6 +857,8 @@ public class AgentModel implements Model, UIController {
      * 保证历史落盘、工具链修复、会话存档这几件事对所有来路一视同仁。
      */
     private Command startAgentTurn(String text) {
+        // 每轮开工前先看一眼 Skill 目录：用户可能刚往里丢了一个新 Skill
+        refreshSkillsIfNeeded();
         // 用户输入先写进 scrollback，再进历史：即使请求失败也能看到自己问了什么
         Command echo = Command.println(Styles.PROMPT.render("❯ ") + Styles.USER.render(text));
         conversation.addUserMessage(text);
@@ -591,6 +951,10 @@ public class AgentModel implements Model, UIController {
         conversation.clear();
         sessionId = SessionManager.newId();
         persistedCount = 0;
+        // 换会话 = 换上下文，激活过的 Skill 也一起清掉；否则压缩恢复块会把上一轮会话的
+        // SOP 带进一个跟它毫无关系的对话里
+        activeSkills.clear();
+        recovery.clearSkills();
         // 重新装配一次记忆索引：清空后对话为空，注入才会发生
         bootstrapMemory();
         usageAvailable = false;
@@ -1108,6 +1472,16 @@ public class AgentModel implements Model, UIController {
 
     private static String thousands(int n) {
         return String.format(Locale.ROOT, "%,d", n);
+    }
+
+    /** 按第一个空白拆成「子命令 + 剩余参数」两段，没输入时返回空串而不是 null。 */
+    private static String[] splitOnce(String args) {
+        String trimmed = args == null ? "" : args.strip();
+        if (trimmed.isEmpty()) {
+            return new String[]{"", ""};
+        }
+        String[] parts = trimmed.split("\\s+", 2);
+        return parts.length == 1 ? new String[]{parts[0], ""} : parts;
     }
 
     /** token 总量的紧凑写法：200000 → 200k。 */

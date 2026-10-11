@@ -76,4 +76,13 @@ public final class RecoveryState {
         files.clear();
         skills.clear();
     }
+
+    /**
+     * 只清 Skill 记录，保留文件快照。
+     * {@code /clear} 开新会话时用：Skill 属于「这次会话在按哪份 SOP 干活」，
+     * 换会话就该清；而最近读过的文件仍然大概率用得上。
+     */
+    public synchronized void clearSkills() {
+        skills.clear();
+    }
 }
