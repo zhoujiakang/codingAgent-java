@@ -28,6 +28,19 @@ public sealed interface Command {
     record PrintLine(String text) implements Command {
     }
 
+    /**
+     * 追加一段文本到当前光标处，<b>不</b>擦除任何已有内容。
+     *
+     * <p>流式正文走这条指令。它的存在是「不重渲染」方案的核心：
+     * 正文已经落到终端历史里就改不回去了，所以模型一个字一个词地往外吐时，
+     * 直接把字写到光标处即可，没必要擦掉整帧再重画一遍。
+     *
+     * <p>与 {@link PrintLine} 的区别只有一个：{@code PrintLine} 会先把当前帧撤掉
+     * 再把文本写进历史；{@code AppendText} 什么都不撤，就地续写。
+     */
+    record AppendText(String text) implements Command {
+    }
+
     /** 一次执行多条指令。 */
     record Batch(List<Command> commands) implements Command {
     }
@@ -45,6 +58,11 @@ public sealed interface Command {
     /** 快捷构造：写入 scrollback。 */
     static Command println(String text) {
         return new PrintLine(text);
+    }
+
+    /** 快捷构造：就地追加，不擦除。 */
+    static Command append(String text) {
+        return new AppendText(text);
     }
 
     /** 快捷构造：批量。 */

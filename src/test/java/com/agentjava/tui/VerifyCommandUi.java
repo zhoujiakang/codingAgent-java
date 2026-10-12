@@ -111,7 +111,11 @@ class VerifyCommandUi {
         assertEquals(2, batch.commands().size());
         String echo = ((Command.PrintLine) batch.commands().get(1)).text();
         assertTrue(echo.contains("设计用户认证模块"), echo);
-        assertTrue(model.view().contains("[PLAN]"), model.view());
+        // 带参数会立刻起一轮生成，模型随即进入追加模式：这一轮不再产出"帧"，
+        // 正文直接追加进终端历史。所以此刻 view() 是空串，状态栏的 [PLAN] 标记
+        // 要等这一轮结束、帧重新画出来才可见——模式切换本身由
+        // planModeTogglesUiState 覆盖（那条用不带参数的 /plan，不触发生成）。
+        assertEquals("", model.view(), "生成期不产出帧：" + model.view());
     }
 
     @Test

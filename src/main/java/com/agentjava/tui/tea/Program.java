@@ -54,6 +54,17 @@ public class Program {
      */
     private String displayedView = null;
 
+    /**
+     * 增量模式下正文当前的可见列数。
+     *
+     * <p>正文是自己按列宽折行的，所以要记住"写到第几列了"。状态行是插在
+     * 正文末尾之后的，撤下它时需要知道退回几列才能回到正文的落笔点。
+     */
+    private int textCol = 0;
+
+    /** 临时状态行当前占的可见列数；0 表示此刻没有状态行。 */
+    private int statusWidth = 0;
+
     public Program(Model model) throws IOException {
         this.model = model;
         this.terminal = TerminalBuilder.builder().system(true).build();
@@ -103,6 +114,9 @@ public class Program {
                     if (measureSize()) {
                         dispatch(new WindowSizeMessage(width, height));
                     }
+                    // 没有新内容到达时才刷新临时状态行（转圈在跳、耗时在走）。
+                    // 正文正在往外吐的时候队列不空，这一行自然让位给正文，不抢光标。
+                    refreshStatusLine();
                 } else if (msg instanceof QuitMessage) {
                     break;
                 } else {
@@ -138,6 +152,8 @@ public class Program {
             running = false;
         } else if (command instanceof Command.PrintLine printLine) {
             printLine(printLine.text());
+        } else if (command instanceof Command.AppendText appendText) {
+            appendText(appendText.text());
         } else if (command instanceof Command.Batch batch) {
             for (Command c : batch.commands()) {
                 execute(c);
@@ -157,17 +173,102 @@ public class Program {
         if (text == null || text.isEmpty()) {
             return;
         }
+        clearStatusRow();
+        // 追加模式下正文可能停在行中间，写历史前先换到干净的一行，
+        // 免得这段文本被粘在正文末尾
+        if (textCol > 0) {
+            terminal.writer().write("\r\n");
+            textCol = 0;
+        }
         clearRendered();
         var writer = terminal.writer();
         writer.write(text.replace("\n", "\r\n"));
         writer.write("\r\n");
         linesRendered = 0;
+        textCol = 0;
         terminal.flush();
+    }
+
+    /**
+     * 就地追加一段文本到光标处，不擦除任何已有内容。
+     *
+     * <p>这是"不重渲染"的关键：流式正文一旦落到终端历史里就改不回去了，
+     * 所以模型一个字一个词地往外吐时，直接把字写在光标处就行，
+     * 不必擦掉整帧再重画整帧。
+     *
+     * <p>折行由调用方（Model）负责——它知道终端宽度，也知道正文写到第几列了。
+     * 这里只认 {@code \n}：遇到就换行，其余字符原样写出并累加列数。
+     */
+    private void appendText(String text) {
+        if (text == null || text.isEmpty()) {
+            return;
+        }
+        // 状态行挡在正文落笔点后面，先撤掉；它会把光标退回到正文末尾
+        clearStatusRow();
+        // 首次追加时把"帧"（输入框 + 状态栏）撤下来，之后就是纯追加了
+        clearRendered();
+
+        var writer = terminal.writer();
+        for (int i = 0; i < text.length(); ) {
+            int cp = text.codePointAt(i);
+            if (cp == '\n') {
+                writer.write("\r\n");
+                textCol = 0;
+            } else {
+                writer.write(Character.toChars(cp));
+                textCol += Ansi.charWidth(cp);
+            }
+            i += Character.charCount(cp);
+        }
+        terminal.flush();
+    }
+
+    /** 按模型当前状态刷新那一行临时状态；模型说没有就撤掉。 */
+    private void refreshStatusLine() {
+        String status = model.statusLine();
+        if (status == null || status.isEmpty()) {
+            clearStatusRow();
+            return;
+        }
+        clearStatusRow();
+        // 正文快占满这一行时不画，免得状态被顶到下一行、把折行算乱
+        int room = width - textCol - 1;
+        if (room < 6) {
+            return;
+        }
+        String shown = Ansi.truncate(status, room);
+        terminal.writer().write(shown);
+        statusWidth = Ansi.displayWidth(shown);
+        terminal.flush();
+    }
+
+    /**
+     * 撤掉临时状态行：光标退回它的起点并清到行尾。
+     *
+     * <p>状态行就画在正文落笔点之后，所以退 {@code statusWidth} 列正好回到
+     * 正文的末尾——正文一个字符都不会被碰到，也不会多出空行。
+     */
+    private void clearStatusRow() {
+        if (statusWidth <= 0) {
+            return;
+        }
+        var writer = terminal.writer();
+        writer.write("\u001b[" + statusWidth + "D");
+        writer.write("\u001b[K");
+        statusWidth = 0;
     }
 
     private void render() {
         String view = model.view();
-        String[] lines = (view == null ? "" : view).split("\n", -1);
+
+        // 追加模式：这一轮模型不产出帧（正文直接写进终端历史），
+        // 把可能残留的旧帧撤掉即可，不画任何东西。
+        if (view == null || view.isEmpty()) {
+            clearRendered();
+            return;
+        }
+
+        String[] lines = view.split("\n", -1);
 
         // 超过可用高度就只留下半部分，避免把终端内容顶出屏幕
         int maxLines = Math.max(3, height - 1);
@@ -193,6 +294,8 @@ public class Program {
         }
         linesRendered = lines.length;
         displayedView = display;
+        // 帧接管了屏幕，正文的列数记账作废——下一次追加重头开始
+        textCol = 0;
         terminal.flush();
     }
 
@@ -342,6 +445,7 @@ public class Program {
         cleanedUp = true;
         running = false;
         try {
+            clearStatusRow();
             clearRendered();
             String history = model == null ? "" : model.dumpHistory();
             if (history != null && !history.isBlank()) {

@@ -34,6 +34,16 @@ public final class Ansi {
         return width;
     }
 
+    /**
+     * 单个码位占的可见列数：ASCII 记 1，CJK 与全角记 2。
+     *
+     * <p>追加模式下要自己按列数折行，必须和视图渲染用同一套宽度判定，
+     * 否则同一段文本在两处算出的列宽不一致，光标回退就会错位。
+     */
+    public static int charWidth(int cp) {
+        return isWide(cp) ? 2 : 1;
+    }
+
     /** 判断一个码位是不是宽字符（粗略覆盖 CJK 与全角区间）。 */
     private static boolean isWide(int cp) {
         return cp >= 0x1100 && (cp <= 0x115F

@@ -306,8 +306,22 @@ public class AgentModel implements Model, UIController {
      */
     private String pendingUserMessage;
 
-    /** 流式缓冲：片段实时进这里，本轮结束才落成一条历史消息（由 Agent 负责落地）。 */
+    /**
+     * 流式正文的累积缓冲。
+     *
+     * <p>它不再参与渲染——正文是直接追加进终端历史的。留着它是因为出错收尾时
+     * 要用这段原文补一条助手消息，也要判断本轮到底有没有产出文本。
+     */
     private final StringBuilder streamBuf = new StringBuilder();
+
+    /**
+     * 追加模式下正文写到第几列了。
+     *
+     * <p>自己按终端宽度折行就必须记住这个数：正文一个词一个词往外吐，
+     * 折行点不能等到一个字放不下才发现。
+     */
+    private int streamCol = 0;
+
     private boolean streaming = false;
     private long requestStartMillis = 0;
     private String spinnerVerb = SpinnerVerbs.random();
@@ -1149,7 +1163,32 @@ public class AgentModel implements Model, UIController {
 
     @Override
     public String view() {
-        return state == AppState.PROVIDER_SELECT ? viewProviderSelect() : viewChat();
+        if (state == AppState.PROVIDER_SELECT) {
+            return viewProviderSelect();
+        }
+        // 生成期不产出帧：正文走"追加"直接写进终端历史，界面交给追加指令驱动。
+        // 这一条同时消掉了闪屏的根因——不再有"整帧擦除 + 整帧重写"。
+        if (streaming) {
+            return "";
+        }
+        return viewChat();
+    }
+
+    /**
+     * 底部那一行临时状态（转圈 / 耗时 / token）。
+     *
+     * <p>只在生成期返回；Program 在没有新消息到达时才拉取它，
+     * 所以正文正在往外吐的时候它自动让位，不跟正文抢光标。
+     */
+    @Override
+    public String statusLine() {
+        if (!streaming) {
+            return null;
+        }
+        long elapsed = System.currentTimeMillis() - requestStartMillis;
+        String tokens = usageAvailable ? " · ↑" + lastInputTokens + " ↓" + lastOutputTokens : "";
+        return Styles.SPINNER.render(SpinnerVerbs.frame() + " " + spinnerVerb
+                + "… (" + (elapsed / 1000) + "s)" + tokens);
     }
 
     // ───────────────────────── 事件处理 ─────────────────────────
@@ -1403,6 +1442,7 @@ public class AgentModel implements Model, UIController {
 
         streaming = true;
         streamBuf.setLength(0);
+        streamCol = 0;
         agentErrored = false;
         spinnerVerb = SpinnerVerbs.random();
         requestStartMillis = System.currentTimeMillis();
@@ -1813,10 +1853,13 @@ public class AgentModel implements Model, UIController {
         // 这里做 diff 增量写，崩溃时最多丢最后一条，而不是丢整个 Turn。
         flushSession();
         return switch (event) {
-            // 正文增量进缓冲区，界面立刻就能看到
+            // 正文增量：直接追加到终端，不重渲染。
+            // 缓冲一份原文只为止损（出错时补消息）与本轮产出判定。
             case AgentEvent.StreamText st -> {
                 streamBuf.append(st.text());
-                yield Command.none();
+                StreamWrap wrapped = wrapStream(st.text(), streamCol, width);
+                streamCol = wrapped.column();
+                yield Command.append(wrapped.text());
             }
             // 工具调用：把"动手"了什么打到 scrollback
             case AgentEvent.ToolUseEvent tu ->
@@ -1859,7 +1902,14 @@ public class AgentModel implements Model, UIController {
         };
     }
 
-    /** 本轮正常结束：缓冲区渲染成 Markdown；历史消息由 Agent 负责落地。 */
+    /**
+     * 本轮正常结束。
+     *
+     * <p>正文在流式过程中已经直接追加进终端历史，<b>就是最终形态</b>：终端历史改不回去，
+     * 所以这里不再做"擦掉原文、换成 Markdown 美化版"。收尾只补一行耗时与 token 统计。
+     *
+     * <p>历史消息仍由 Agent 负责落地，这里不重复写。
+     */
     private Command finishTurn(String fullText) {
         if (agentErrored) {
             streaming = false;
@@ -1877,10 +1927,9 @@ public class AgentModel implements Model, UIController {
         if (fullText.isBlank()) {
             return Command.println(Styles.MUTED.render("（本轮没有返回文本内容）"));
         }
-        String rendered = MarkdownRenderer.render(fullText, Math.max(30, width - 2));
         String meta = Styles.MUTED.render("✻ " + spinnerVerb + " for " + formatSeconds(elapsed)
                 + " · ↑" + lastInputTokens + " ↓" + lastOutputTokens);
-        return Command.println(rendered + "\n" + meta);
+        return Command.println(meta);
     }
 
     /** 本轮失败：错误以独立样式展示，程序不退出，用户可以直接问下一句。 */
@@ -2133,20 +2182,16 @@ public class AgentModel implements Model, UIController {
         return String.join("\n", lines);
     }
 
+    /**
+     * 空闲态的帧：分隔线 + 输入框 + 状态栏。
+     *
+     * <p>生成期不再走这里——那时 {@link #view()} 返回空串，正文由追加指令直接写屏。
+     * 之所以能把流式内容从帧里彻底摘掉，是因为流式期间键盘输入本来就被锁死了
+     * （见 {@link #handleChatKey}），底部这个输入框在那段时间没有存在价值。
+     */
     private String viewChat() {
         List<String> lines = new ArrayList<>();
         lines.add(separator());
-
-        if (streaming) {
-            long elapsed = System.currentTimeMillis() - requestStartMillis;
-            lines.add(Styles.SPINNER.render("✻ " + SpinnerVerbs.frame() + " " + spinnerVerb + "… ("
-                    + (elapsed / 1000) + "s)"));
-            if (!streamBuf.isEmpty()) {
-                lines.addAll(List.of(streamBuf.toString().split("\n", -1)));
-            }
-            lines.add(separator());
-        }
-
         lines.addAll(renderInputBox());
         lines.add(renderStatusBar());
         return String.join("\n", lines);
@@ -2279,6 +2324,58 @@ public class AgentModel implements Model, UIController {
     }
 
     // ───────────────────────── 小工具 ─────────────────────────
+
+    /**
+     * 流式片段按宽度折行后的结果：可直接追加的文本 + 新的列数。
+     *
+     * <p>折行是有状态的（要跨片段记住写到第几列），所以把"新列数"一并返回，
+     * 由调用方保存到下一片段。
+     */
+    record StreamWrap(String text, int column) {
+    }
+
+    /**
+     * 把一段流式片段按终端宽度切成可直接追加的文本。
+     *
+     * <p>为什么要自己折行、而不是交给终端：终端自动折行后我们无从得知
+     * "这一行还剩几列"，临时状态行就没法准确地退回正文落笔点。
+     * 自己折行让列数始终等于真实值。
+     *
+     * <p>每行只用到 {@code width - 1} 列，刻意留一列——正好写满最后一列会触发
+     * 终端自动折行，那是一次不受控的换行，会把列数记账算错。
+     *
+     * <p>片段里的 {@code \n}（模型吐的换行/段落）原样透传，并把列数归零。
+     *
+     * @param chunk 本片段的原始文本
+     * @param col   本片段开始处光标所在的列（可见宽度）
+     * @param width 终端宽度
+     */
+    static StreamWrap wrapStream(String chunk, int col, int width) {
+        if (chunk == null || chunk.isEmpty()) {
+            return new StreamWrap("", col);
+        }
+        int max = Math.max(20, width) - 1;
+        StringBuilder out = new StringBuilder();
+        int cur = col;
+        for (int i = 0; i < chunk.length(); ) {
+            int cp = chunk.codePointAt(i);
+            if (cp == '\n') {
+                out.append('\n');
+                cur = 0;
+                i++;
+                continue;
+            }
+            int cw = Ansi.charWidth(cp);
+            if (cur + cw > max) {
+                out.append('\n');
+                cur = 0;
+            }
+            out.appendCodePoint(cp);
+            cur += cw;
+            i += Character.charCount(cp);
+        }
+        return new StreamWrap(out.toString(), cur);
+    }
 
     /** 按可见宽度软换行。 */
     private static List<String> wrapPlain(String text, int maxWidth) {
